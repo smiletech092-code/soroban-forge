@@ -70,6 +70,33 @@ cargo run -- new demo --template token
 cd demo && cargo test && cd .. && rm -rf demo
 ```
 
+## Changelog
+
+All notable changes must be recorded in `CHANGELOG.md`. The file is generated
+automatically from [Conventional Commits](https://www.conventionalcommits.org)
+using [git-cliff](https://git-cliff.org).
+
+Install git-cliff once:
+
+```sh
+cargo install git-cliff
+```
+
+Preview what the next release entry will look like (dry run, nothing written):
+
+```sh
+git cliff --unreleased
+```
+
+Regenerate the full `CHANGELOG.md`:
+
+```sh
+git cliff -o CHANGELOG.md
+```
+
+See [docs/changelog.md](docs/changelog.md) for the full reference including CI
+integration and commit-type → section mapping.
+
 Working on templates or presets? They are embedded into the binary at compile
 time (`include_dir`), so just edit the files under `templates/` or `presets/`
 and rebuild. Do **not** rename `Cargo.toml.hbs` files to `Cargo.toml` — cargo

@@ -45,6 +45,7 @@ pub const CONTRACT_ID_LEN: usize = 56;
 
 /// Every wasm module starts with these four bytes.
 const WASM_MAGIC: &[u8] = b"\0asm";
+const WASM_VERSION_1: &[u8] = b"\x01\0\0\0";
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -107,10 +108,8 @@ pub fn resolve_local_wasm(dir: &Path, wasm_override: Option<&Path>) -> Result<Pa
     Ok(wasm_path)
 }
 
-/// Cheap shape check on a strkey contract ID so an obvious typo fails before
-/// we shell out to the network. Contract IDs are 56 base32 characters
-/// starting with `C`; the checksum is left to the `stellar` CLI, which
-/// decodes the strkey for real.
+/// Validate both the shape and StrKey checksum locally, before any network
+/// call or stellar-cli invocation.
 pub fn validate_contract_id(id: &str) -> Result<()> {
     let invalid = |reason: &str| {
         Err(ForgeError::InvalidArgument(format!(
@@ -130,6 +129,11 @@ pub fn validate_contract_id(id: &str) -> Result<()> {
     {
         return invalid("contains characters outside the base32 alphabet");
     }
+    if stellar_strkey::Contract::from_string(id).is_err() {
+        return Err(ForgeError::InvalidArgument(format!(
+            "`{id}` is not a valid contract ID (checksum failure)"
+        )));
+    }
     Ok(())
 }
 
@@ -148,9 +152,17 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 pub fn hash_wasm_file(path: &Path) -> Result<String> {
     let bytes =
         std::fs::read(path).map_err(ForgeError::io(format!("reading {}", path.display())))?;
-    if !bytes.starts_with(WASM_MAGIC) {
+    if bytes.len() < WASM_MAGIC.len() || !bytes.starts_with(WASM_MAGIC) {
         return Err(ForgeError::InvalidArgument(format!(
             "{} is not a wasm module (missing the \\0asm header)",
+            path.display()
+        )));
+    }
+    if bytes.len() < WASM_MAGIC.len() + WASM_VERSION_1.len()
+        || &bytes[WASM_MAGIC.len()..WASM_MAGIC.len() + WASM_VERSION_1.len()] != WASM_VERSION_1
+    {
+        return Err(ForgeError::InvalidArgument(format!(
+            "{} is a corrupted wasm module (expected version 1 header)",
             path.display()
         )));
     }
@@ -185,7 +197,7 @@ impl NetworkArgs {
         from_config: Option<&ConfigNetwork>,
     ) -> Self {
         let cfg = from_config.cloned().unwrap_or_default();
-        let cli_network = network;
+        let cli_network = network.map(normalize_network_name);
         let cli_rpc = rpc_url;
         let network = match (cli_network.as_ref(), cli_rpc.as_ref()) {
             (Some(name), _) => Some(name.clone()),
@@ -229,6 +241,16 @@ impl NetworkArgs {
             args.push(passphrase.clone());
         }
         args
+    }
+}
+
+/// Normalize only well-known stellar-cli network presets. Custom named
+/// networks may be case-sensitive, so they pass through untouched.
+fn normalize_network_name(value: String) -> String {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "testnet" | "mainnet" | "futurenet" | "standalone" => normalized,
+        _ => value,
     }
 }
 
@@ -509,6 +531,21 @@ pub fn json_report(report: &VerifyReport) -> String {
     serde_json::to_string_pretty(report).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
 }
 
+/// Human-readable reports for a batch verification, one verdict per contract.
+pub fn format_reports(reports: &[VerifyReport]) -> String {
+    reports.iter().map(format_report).collect()
+}
+
+/// JSON batch output. A batch is always represented as an array so scripts can
+/// handle one and many contract IDs with the same decoder.
+pub fn json_reports(reports: &[VerifyReport]) -> String {
+    serde_json::to_string_pretty(reports).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+}
+
+fn reports_match(reports: &[VerifyReport]) -> bool {
+    reports.iter().all(|report| report.matches)
+}
+
 /// The mismatch error returned to the CLI core, which turns it into exit
 /// code `1`.
 pub fn mismatch_error(report: &VerifyReport) -> ForgeError {
@@ -630,6 +667,28 @@ pub fn verify(
     reproducible: bool,
     timeout: Option<Duration>,
 ) -> Result<VerifyReport> {
+    verify_with_keep_fetched(
+        contract_id,
+        contract_dir,
+        wasm_override,
+        network,
+        reproducible,
+        timeout,
+        None,
+    )
+}
+
+/// Verify a contract and optionally retain the fetched on-chain wasm after
+/// this command's temporary workspace is cleaned up.
+pub fn verify_with_keep_fetched(
+    contract_id: &str,
+    contract_dir: &Path,
+    wasm_override: Option<&Path>,
+    network: &NetworkArgs,
+    reproducible: bool,
+    timeout: Option<Duration>,
+    keep_fetched: Option<&Path>,
+) -> Result<VerifyReport> {
     validate_contract_id(contract_id)?;
 
     let local_wasm = if reproducible {
@@ -642,6 +701,9 @@ pub fn verify(
     let scratch = tempfile::tempdir().map_err(ForgeError::io("creating a temporary directory"))?;
     let fetched = scratch.path().join("onchain.wasm");
     fetch_onchain_wasm(contract_id, network, &fetched, timeout)?;
+    if let Some(destination) = keep_fetched {
+        copy_fetched_wasm(&fetched, destination)?;
+    }
     let onchain_hash = hash_wasm_file(&fetched)?;
 
     let report = VerifyReport::new(
@@ -658,6 +720,15 @@ pub fn verify(
     // network round-trip.
     let diff = spec_diff_for(&fetched, &local_wasm);
     Ok(report.with_spec_diff(diff))
+}
+
+/// Copy the fetched artifact before its temporary directory is dropped.
+fn copy_fetched_wasm(fetched: &Path, destination: &Path) -> Result<()> {
+    std::fs::copy(fetched, destination).map_err(ForgeError::io(format!(
+        "copying fetched wasm to {}",
+        destination.display()
+    )))?;
+    Ok(())
 }
 
 /// Run the official soroban build inside the pinned image and return the
@@ -735,8 +806,9 @@ impl ForgePlugin for VerifyPlugin {
             .arg(
                 Arg::new("contract-id")
                     .required(true)
+                    .num_args(1..)
                     .value_name("CONTRACT_ID")
-                    .help("Deployed contract ID (C…)"),
+                    .help("One or more deployed contract IDs (C…)"),
             )
             .arg(
                 Arg::new("path")
@@ -771,14 +843,22 @@ impl ForgePlugin for VerifyPlugin {
                     .action(ArgAction::SetTrue)
                     .help("Build the contract inside the pinned reproducible-build container before hashing"),
             )
+            .arg(
+                Arg::new("keep-fetched")
+                    .long("keep-fetched")
+                    .value_name("PATH")
+                    .help("Keep the fetched on-chain wasm at PATH; with multiple IDs, PATH must be a directory"),
+            )
     }
 
     fn run(&self, matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
-        let contract_id = matches
-            .get_one::<String>("contract-id")
-            .expect("contract-id is required by clap");
+        let contract_ids: Vec<&String> = matches
+            .get_many::<String>("contract-id")
+            .expect("contract-id is required by clap")
+            .collect();
 
-        if ctx.offline {
+        let wasm_hash = matches.get_one::<String>("wasm-hash");
+        if ctx.offline && wasm_hash.is_none() {
             return Err(ForgeError::InvalidArgument(
                 "verify is unavailable in offline mode because it must fetch deployed wasm".into(),
             ));
@@ -797,26 +877,80 @@ impl ForgePlugin for VerifyPlugin {
             ctx.config.as_ref().map(|c| &c.network),
         );
 
-        let reproducible = matches.get_flag("reproducible");
-        let report = verify(
-            contract_id,
-            &dir,
-            wasm_override.as_deref(),
-            &network,
-            reproducible,
-            ctx.timeout(),
-        )?;
+        // Issue #281: fall back to recorded contract ID when none is given.
+        let contract_id: String = match matches.get_one::<String>("contract-id") {
+            Some(id) => id.clone(),
+            None => {
+                let crate_name = read_crate_name(&dir).unwrap_or_default();
+                let net_label = network
+                    .network
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_NETWORK.to_string());
+                soroban_forge_deploy::lookup_recorded_contract_id(&dir, &crate_name, &net_label)
+                    .ok_or_else(|| {
+                        ForgeError::InvalidArgument(
+                            "no contract-id given and no deployment recorded in deployments.json — \
+                             run `soroban-forge deploy` first or pass a contract ID explicitly"
+                                .into(),
+                        )
+                    })?
+            }
+        };
 
-        if ctx.json {
-            println!("{}", json_report(&report));
-        } else if !ctx.quiet {
-            print!("{}", format_report(&report));
+        let reproducible = matches.get_flag("reproducible");
+        let keep_fetched = matches
+            .get_one::<String>("keep-fetched")
+            .map(|p| ctx.cwd.join(p));
+        if contract_ids.len() > 1 {
+            if let Some(path) = &keep_fetched {
+                if !path.is_dir() {
+                    return Err(ForgeError::InvalidArgument(format!(
+                        "--keep-fetched must name a directory when verifying multiple contract IDs: {}",
+                        path.display()
+                    )));
+                }
+            }
         }
 
-        if report.matches {
+        let mut reports = Vec::with_capacity(contract_ids.len());
+        for contract_id in contract_ids {
+            let keep_path = keep_fetched.as_ref().map(|path| {
+                if path.is_dir() {
+                    path.join(format!("{contract_id}.wasm"))
+                } else {
+                    path.clone()
+                }
+            });
+            reports.push(verify_with_keep_fetched(
+                contract_id,
+                &dir,
+                wasm_override.as_deref(),
+                &network,
+                reproducible,
+                ctx.timeout(),
+                keep_path.as_deref(),
+            )?);
+        }
+
+        if ctx.json {
+            println!("{}", json_reports(&reports));
+        } else if !ctx.quiet {
+            print!("{}", format_reports(&reports));
+        }
+
+        if reports_match(&reports) {
             Ok(())
         } else {
-            Err(mismatch_error(&report))
+            let mismatches: Vec<&str> = reports
+                .iter()
+                .filter(|report| !report.matches)
+                .map(|report| report.contract_id.as_str())
+                .collect();
+            Err(ForgeError::VerificationFailed(format!(
+                "{} contract verification mismatch(es): {}",
+                mismatches.len(),
+                mismatches.join(", ")
+            )))
         }
     }
 }
@@ -825,8 +959,7 @@ impl ForgePlugin for VerifyPlugin {
 mod tests {
     use super::*;
 
-    /// A syntactically valid contract ID (shape only — no real checksum).
-    const VALID_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const VALID_ID: &str = "CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAXE";
 
     fn wasm_bytes(payload: &[u8]) -> Vec<u8> {
         let mut bytes = b"\0asm\x01\0\0\0".to_vec();
@@ -867,6 +1000,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_wasm_with_a_corrupted_version_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("corrupt.wasm");
+        std::fs::write(&path, b"\0asm\x02\0\0\0payload").unwrap();
+
+        let err = hash_wasm_file(&path).unwrap_err();
+        assert!(err.to_string().contains("corrupted wasm"), "{err}");
+    }
+
+    #[test]
     fn accepts_a_well_formed_contract_id() {
         assert!(validate_contract_id(VALID_ID).is_ok());
     }
@@ -891,6 +1034,13 @@ mod tests {
                 soroban_forge_core::error::ExitCode::UserError
             );
         }
+    }
+
+    #[test]
+    fn rejects_a_shape_valid_contract_id_with_an_invalid_checksum() {
+        let err = validate_contract_id("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+            .unwrap_err();
+        assert!(err.to_string().contains("checksum failure"), "{err}");
     }
 
     #[test]
@@ -950,7 +1100,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // No Cargo.toml, no wasm, no `stellar` on PATH — the ID check still
         // decides the outcome, so nothing here shells out.
-        let err = verify("nope", tmp.path(), None, &NetworkArgs::default(), false, None).unwrap_err();
+        let err = verify(
+            "nope",
+            tmp.path(),
+            None,
+            &NetworkArgs::default(),
+            false,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("not a valid contract ID"), "{err}");
     }
 
@@ -963,7 +1121,15 @@ mod tests {
         )
         .unwrap();
 
-        let err = verify(VALID_ID, tmp.path(), None, &NetworkArgs::default(), false, None).unwrap_err();
+        let err = verify(
+            VALID_ID,
+            tmp.path(),
+            None,
+            &NetworkArgs::default(),
+            false,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("stellar contract build"), "{err}");
     }
 
@@ -978,6 +1144,12 @@ mod tests {
     fn an_explicit_network_is_passed_through() {
         let network = NetworkArgs::resolve(Some("mainnet".into()), None, None, None);
         assert_eq!(network.cli_args(), vec!["--network", "mainnet"]);
+    }
+
+    #[test]
+    fn normalizes_well_known_network_names() {
+        let network = NetworkArgs::resolve(Some("  TestNet  ".into()), None, None, None);
+        assert_eq!(network.cli_args(), vec!["--network", "testnet"]);
     }
 
     #[test]
@@ -1032,6 +1204,46 @@ mod tests {
         assert_eq!(parsed["network"], "testnet");
         assert_eq!(parsed["local_hash"], "aa");
         assert_eq!(parsed["onchain_hash"], "bb");
+    }
+
+    #[test]
+    fn batch_reports_are_an_array_and_preserve_each_verdict() {
+        let matching = VerifyReport::new(VALID_ID, "testnet", Path::new("a.wasm"), "aa", "aa");
+        let mismatching = VerifyReport::new(
+            "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+            "testnet",
+            Path::new("b.wasm"),
+            "aa",
+            "bb",
+        );
+        let reports = vec![matching, mismatching];
+
+        assert!(!reports_match(&reports));
+        let parsed: serde_json::Value = serde_json::from_str(&json_reports(&reports)).unwrap();
+        assert!(parsed.is_array());
+        assert_eq!(parsed.as_array().unwrap().len(), 2);
+        assert_eq!(parsed[0]["match"], true);
+        assert_eq!(parsed[1]["match"], false);
+
+        let text = format_reports(&reports);
+        assert!(
+            text.contains("verified") && text.contains("MISMATCH"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn keeping_a_fetched_wasm_copies_it_outside_the_temporary_location() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fetched = tmp.path().join("fetched.wasm");
+        let kept = tmp.path().join("kept.wasm");
+        let bytes = wasm_bytes(b"on-chain");
+        std::fs::write(&fetched, &bytes).unwrap();
+
+        copy_fetched_wasm(&fetched, &kept).unwrap();
+        std::fs::remove_file(&fetched).unwrap();
+
+        assert_eq!(std::fs::read(&kept).unwrap(), bytes);
     }
 
     #[test]

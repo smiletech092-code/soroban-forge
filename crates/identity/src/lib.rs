@@ -1,7 +1,7 @@
 //! # soroban-forge-identity
 //!
-//! `soroban-forge identity generate|list|fund` — manage test keypairs and
-//! fund them via friendbot on testnet.
+//! `soroban-forge identity generate|list|fund|remove` — manage test keypairs
+//! and fund them via friendbot on testnet.
 //!
 //! Identities are stored as a JSON file at
 //! `~/.config/soroban-forge/identities.json`.
@@ -51,15 +51,26 @@ pub fn load_store(path: &PathBuf) -> Result<IdentityStore> {
 }
 
 /// Save the identity store to disk, creating parent directories as needed.
+///
+/// Writes through [`soroban_forge_core::atomic::write_atomic`] (#470): a crash
+/// or disk-full error partway through must not leave `identities.json`
+/// truncated, because the next `load_store` would then fail to parse and every
+/// stored identity would be lost.
 pub fn save_store(path: &PathBuf, store: &IdentityStore) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
-    }
     let json = serde_json::to_string_pretty(store)
         .map_err(|e| ForgeError::Other(format!("serializing identity store: {e}")))?;
-    std::fs::write(path, json)
-        .map_err(ForgeError::io(format!("writing {}", path.display())))
+    soroban_forge_core::atomic::write_atomic(path, &json)
+        .map_err(|e| ForgeError::Other(format!("writing {}: {e}", path.display())))
+}
+
+fn remove_identity(path: &PathBuf, name: &str) -> Result<()> {
+    let mut store = load_store(path)?;
+    if store.identities.remove(name).is_none() {
+        return Err(ForgeError::InvalidArgument(format!(
+            "identity `{name}` not found (use `soroban-forge identity list` to see available identities)"
+        )));
+    }
+    save_store(path, &store)
 }
 
 /// Generate a new Stellar keypair and return `(public_key, secret_key)` as
@@ -90,26 +101,76 @@ fn http_get(
     request.call()
 }
 
-/// Fund a Stellar testnet account via friendbot.
+/// Friendbot host for a network passphrase.
+///
+/// Testnet and futurenet each run their own friendbot deployment, and the
+/// futurenet one is a different host — `friendbot.stellar.org` is testnet-only
+/// (#471). Sending a futurenet account to the testnet friendbot either funds an
+/// account on the wrong network or fails outright, despite the error message
+/// below claiming futurenet is supported.
+///
+/// Returns `None` for a passphrase this crate does not know, so the caller can
+/// refuse rather than silently default to testnet.
+fn friendbot_host_for(passphrase: &str) -> Option<&'static str> {
+    if passphrase.contains("Public Global Stellar Network") {
+        // Mainnet — no friendbot exists at all.
+        None
+    } else if passphrase.contains("Future Network") {
+        Some("https://friendbot-futurenet.stellar.org")
+    } else if passphrase.contains("Test SDF Network") {
+        Some("https://friendbot.stellar.org")
+    } else {
+        // Standalone/local networks run their own friendbot; this crate has no
+        // way to guess its host, and guessing testnet would fund the wrong
+        // network.
+        None
+    }
+}
+
+/// Build the friendbot request URL for a network, or `None` when the network
+/// has no known friendbot.
+///
+/// Split out from [`fund_friendbot`] so the URL construction — which is the
+/// part that was wrong in #471 — is testable without making a network call.
+pub fn friendbot_url(public_key: &str, network_passphrase: Option<&str>) -> Option<String> {
+    let passphrase = network_passphrase?;
+    let host = friendbot_host_for(passphrase)?;
+    Some(format!("{host}/?addr={public_key}"))
+}
+
+/// Fund a Stellar testnet/futurenet account via friendbot.
 /// Returns the parsed balance (in XLM) on success.
 ///
-/// Refuses to run on mainnet (passphrase contains "Public Global Stellar Network").
-/// The request is bounded by `timeout` when set (`--timeout`).
+/// The friendbot host is chosen from the effective network passphrase (#471):
+/// testnet and futurenet have separate deployments. Mainnet, and any passphrase
+/// this crate does not recognize, is refused rather than silently funded on
+/// testnet. The request is bounded by `timeout` when set (`--timeout`).
 pub fn fund_friendbot(
     public_key: &str,
     network_passphrase: Option<&str>,
     timeout: Option<Duration>,
 ) -> Result<String> {
     // #287 — refuse to run on mainnet
-    if let Some(passphrase) = network_passphrase {
-        if passphrase.contains("Public Global Stellar Network") {
-            return Err(ForgeError::InvalidArgument(
-                "friendbot funding is only available on testnet/futurenet, not mainnet".into(),
-            ));
-        }
+    let Some(passphrase) = network_passphrase else {
+        return Err(ForgeError::InvalidArgument(
+            "friendbot funding needs a known network passphrase; \
+             set a network with `soroban-forge network use <name>`"
+                .into(),
+        ));
+    };
+    if passphrase.contains("Public Global Stellar Network") {
+        return Err(ForgeError::InvalidArgument(
+            "friendbot funding is only available on testnet/futurenet, not mainnet".into(),
+        ));
     }
 
-    let url = format!("https://friendbot.stellar.org/?addr={public_key}");
+    let Some(url) = friendbot_url(public_key, network_passphrase) else {
+        return Err(ForgeError::InvalidArgument(format!(
+            "no friendbot is known for the network passphrase {passphrase:?}; \
+             friendbot funding supports testnet and futurenet only"
+        )));
+    };
+
     log::debug!("requesting friendbot: {url}");
     let response = http_get(&url, timeout).map_err(|e| {
         // Surface actionable error messages (#287)
@@ -216,6 +277,15 @@ impl ForgePlugin for IdentityPlugin {
                             .help("Network passphrase (used to refuse mainnet funding)"),
                     ),
             )
+            .subcommand(
+                Command::new("remove")
+                    .about("Remove a stored identity")
+                    .arg(
+                        Arg::new("name")
+                            .help("Name of the identity to remove")
+                            .required(true),
+                    ),
+            )
     }
 
     fn run(&self, matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
@@ -308,6 +378,18 @@ impl ForgePlugin for IdentityPlugin {
                     } else {
                         print!("{}", format_list(&store));
                     }
+                }
+                Ok(())
+            }
+
+            Some(("remove", sub)) => {
+                let name = sub.get_one::<String>("name").unwrap();
+                remove_identity(&path, name)?;
+
+                if ctx.json {
+                    println!("{}", serde_json::json!({ "name": name, "removed": true }));
+                } else if !ctx.quiet {
+                    println!("removed identity `{name}`");
                 }
                 Ok(())
             }
@@ -427,6 +509,32 @@ mod tests {
     }
 
     #[test]
+    fn remove_identity_updates_store_and_rejects_missing_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identities.json");
+        let mut store = IdentityStore::default();
+        for name in ["alice", "bob"] {
+            store.identities.insert(
+                name.into(),
+                Identity {
+                    public_key: format!("G{name}"),
+                    secret_key: format!("S{name}"),
+                },
+            );
+        }
+        save_store(&path, &store).unwrap();
+
+        remove_identity(&path, "alice").unwrap();
+
+        let updated = load_store(&path).unwrap();
+        assert!(!updated.identities.contains_key("alice"));
+        assert_eq!(updated.identities["bob"].public_key, "Gbob");
+
+        let error = remove_identity(&path, "carol").unwrap_err();
+        assert!(error.to_string().contains("identity `carol` not found"));
+    }
+
+    #[test]
     fn format_list_empty() {
         let store = IdentityStore::default();
         assert!(format_list(&store).contains("no identities stored"));
@@ -514,6 +622,162 @@ mod tests {
         );
     }
 
+    // #471 — the friendbot host is chosen per network, not hardcoded to testnet
+    #[test]
+    fn friendbot_host_is_chosen_per_network() {
+        // Testnet and futurenet run separate friendbot deployments.
+        assert_eq!(
+            friendbot_host_for("Test SDF Network ; September 2015"),
+            Some("https://friendbot.stellar.org")
+        );
+        assert_eq!(
+            friendbot_host_for("Test SDF Future Network ; October 2022"),
+            Some("https://friendbot-futurenet.stellar.org")
+        );
+    }
+
+    #[test]
+    fn friendbot_host_is_none_for_mainnet_and_unknown_networks() {
+        assert_eq!(friendbot_host_for("Public Global Stellar Network ; September 2015"), None);
+        // An unrecognized/custom passphrase must not silently fall back to the
+        // testnet friendbot — that would fund an account on the wrong network.
+        assert_eq!(friendbot_host_for("Standalone Network ; February 2017"), None);
+        assert_eq!(friendbot_host_for("Some Custom Network"), None);
+    }
+
+    #[test]
+    fn fund_friendbot_uses_the_futurenet_host_for_a_futurenet_passphrase() {
+        // The bug in #471 was that this request went to friendbot.stellar.org
+        // (testnet) regardless of the passphrase. Assert on the URL the
+        // function actually builds, without making the request.
+        let url = friendbot_url(
+            "GABC",
+            Some("Test SDF Future Network ; October 2022"),
+        )
+        .expect("futurenet should resolve to a friendbot host");
+        assert!(
+            url.starts_with("https://friendbot-futurenet.stellar.org/"),
+            "futurenet must use its own friendbot host, got {url}"
+        );
+        assert!(
+            !url.contains("//friendbot.stellar.org"),
+            "futurenet must not use the testnet friendbot, got {url}"
+        );
+    }
+
+    #[test]
+    fn fund_friendbot_refuses_a_custom_passphrase() {
+        // Not mainnet, but not a network with a known friendbot either: the
+        // error must say so rather than defaulting to testnet.
+        let result = fund_friendbot("GABC", Some("Standalone Network ; February 2017"), None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Standalone Network"),
+            "error should name the unrecognized passphrase: {msg}"
+        );
+    }
+
+    #[test]
+    fn fund_friendbot_requires_a_passphrase() {
+        let result = fund_friendbot("GABC", None, None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("passphrase"),
+            "error should explain a passphrase is needed: {msg}"
+        );
+    // #470 — a crash mid-write must not corrupt the identity store
+    #[test]
+    fn save_store_replaces_the_file_atomically() {
+        let dir = std::env::temp_dir().join(format!("sf-identity-470-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identities.json");
+
+        // Write a store with one identity, then a larger one, then a smaller
+        // one. A truncate-and-write would risk a reader seeing a prefix of the
+        // new content; an atomic rename cannot.
+        let mut store = IdentityStore::default();
+        store.identities.insert(
+            "alice".into(),
+            Identity { public_key: "GALICE".into(), secret_key: "SALICE".into() },
+        );
+        save_store(&path, &store).unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+
+        store.identities.insert(
+            "bob".into(),
+            Identity { public_key: "GBOB".into(), secret_key: "SBOB".into() },
+        );
+        save_store(&path, &store).unwrap();
+
+        store.identities.remove("alice");
+        save_store(&path, &store).unwrap();
+
+        // Whatever the write sequence, the file always parses and holds exactly
+        // what was last written.
+        let loaded = load_store(&path).unwrap();
+        assert_eq!(loaded.identities.len(), 1);
+        assert!(loaded.identities.contains_key("bob"));
+        assert_ne!(std::fs::read_to_string(&path).unwrap(), first);
+
+        // No temporary file left behind for the next run to trip over.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["identities.json".to_string()], "stray files: {names:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_save_leaves_the_previous_store_readable() {
+        // The property the issue is really about: whatever goes wrong, the
+        // previously saved identities are still there afterwards.
+        let dir = std::env::temp_dir().join(format!("sf-identity-470b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("identities.json");
+        let mut store = IdentityStore::default();
+        store.identities.insert(
+            "alice".into(),
+            Identity { public_key: "GALICE".into(), secret_key: "SALICE".into() },
+        );
+        save_store(&path, &store).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // Make the destination directory read-only so the temporary file cannot
+        // be created; the rename therefore never happens.
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        let readonly = perms.clone();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let mut updated = store.clone();
+        updated.identities.insert(
+            "bob".into(),
+            Identity { public_key: "GBOB".into(), secret_key: "SBOB".into() },
+        );
+        let result = save_store(&path, &updated);
+
+        // Restore permissions before asserting, so the temp dir can be removed.
+        std::fs::set_permissions(&dir, readonly).unwrap();
+
+        if result.is_err() {
+            // The write was refused, and the store on disk is untouched.
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            assert_eq!(load_store(&path).unwrap().identities.len(), 1);
+        }
+        // On a platform where a read-only directory is not enforced (or when
+        // running as root), the write simply succeeded — the store still parses.
+        assert!(load_store(&path).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // #287 — fund refuses on mainnet passphrase
     #[test]
     fn fund_friendbot_refuses_mainnet_passphrase() {
@@ -557,6 +821,7 @@ mod tests {
         assert!(sub_names.contains(&"generate"));
         assert!(sub_names.contains(&"list"));
         assert!(sub_names.contains(&"fund"));
+        assert!(sub_names.contains(&"remove"));
     }
 
     // #287 — fund refuses offline

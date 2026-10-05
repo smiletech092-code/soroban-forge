@@ -1,0 +1,428 @@
+# Builds the pre-compiled `soroban-forge` binaries that the Homebrew tap and
+# `cargo binstall` download, and publishes them to GitHub Releases.
+#
+# Without this workflow the Homebrew formula is inert: it points at
+# `releases/download/v<VERSION>/soroban-forge-<VERSION>-<TARGET>.tar.gz`, and
+# nothing else in the repository creates those archives.
+#
+# Archive layout is fixed by two existing contracts and must not change
+# casually:
+#   * homebrew-tap/Formula/soroban-forge.rb does `bin.install "soroban-forge"`
+#   * Cargo.toml's `[package.metadata.binstall]` sets
+#     `bin-dir = "{ bin }{ binary-ext }"`
+# Both require the binary to sit at the archive *root*, so each archive holds
+# exactly one file and no wrapping directory.
+#
+# Triggers:
+#   * pushing a `v*` tag  -> builds, publishes a release, refreshes the formula
+#   * workflow_dispatch   -> builds only, uploading archives as run artifacts
+#                            so the matrix can be exercised without releasing
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, without the leading v (e.g. 0.2.0). Builds archives as run artifacts; does not publish a release."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve the version once and fail early if the tag disagrees with
+  # Cargo.toml.  A mismatch would ship a binary whose `--version` output does
+  # not match the `version` field the formula installs, which makes the
+  # formula's own `test do` block fail after the release is already public.
+  # ---------------------------------------------------------------------------
+  version:
+    name: resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Resolve and verify version
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$INPUT_VERSION"
+          else
+            # refs/tags/v0.2.0 -> 0.2.0
+            version="${GITHUB_REF_NAME#v}"
+          fi
+
+          if [ -z "$version" ]; then
+            echo "::error::could not resolve a version to build"
+            exit 1
+          fi
+
+          # The workspace version is the single source of truth for what
+          # `--version` will print.
+          cargo_version="$(
+            sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml |
+              sed -n 's/^version *= *"\([^"]*\)".*/\1/p' | head -1
+          )"
+
+          if [ -z "$cargo_version" ]; then
+            echo "::error::could not read version from [workspace.package] in Cargo.toml"
+            exit 1
+          fi
+
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::version mismatch: building '$version' but Cargo.toml declares '$cargo_version'. Bump [workspace.package].version (and Cargo.lock) before tagging."
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building soroban-forge $version"
+
+  # ---------------------------------------------------------------------------
+  # One archive per platform the formula and the binstall metadata advertise.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Keep going so one broken target does not hide the state of the others;
+      # the publish job below refuses to release a partial matrix.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            # `ureq` pulls in rustls -> ring, which compiles C and assembly, so
+            # a cross build needs the cross C compiler as well as the linker.
+            apt_packages: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            exe: .exe
+            archive_ext: zip
+    defaults:
+      run:
+        # Git Bash on the Windows runner, so one script covers every platform.
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross-compilation toolchain
+        if: matrix.apt_packages != ''
+        env:
+          APT_PACKAGES: ${{ matrix.apt_packages }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $APT_PACKAGES
+
+      - name: Build release binary
+        env:
+          TARGET: ${{ matrix.target }}
+          LINKER: ${{ matrix.linker }}
+        run: |
+          set -euo pipefail
+          if [ -n "$LINKER" ]; then
+            # Cargo reads CARGO_TARGET_<TRIPLE>_LINKER, where the triple is
+            # upper-cased with dashes turned into underscores. The `cc` crate
+            # reads the lower-case CC_<triple> form, which ring's build
+            # script needs.
+            upper="$(echo "$TARGET" | tr '[:lower:]-' '[:upper:]_')"
+            lower="$(echo "$TARGET" | tr '-' '_')"
+            export "CARGO_TARGET_${upper}_LINKER=$LINKER"
+            export "CC_${lower}=$LINKER"
+          fi
+          # NOTE: `--locked` is deliberately omitted. The committed Cargo.lock
+          # is currently missing entries for `clap_mangen`, `roff`, and
+          # `soroban-forge-update-check`, so `cargo build --locked` fails
+          # outright. Regenerating the lockfile is outside the scope of the
+          # change that added this workflow; once it is back in sync, add
+          # `--locked` here so release builds are reproducible.
+          cargo build --release --bin soroban-forge --target "$TARGET"
+
+      - name: Package archive
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext || 'tar.gz' }}
+        run: |
+          set -euo pipefail
+          archive="soroban-forge-${VERSION}-${TARGET}.${ARCHIVE_EXT}"
+          outdir="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$outdir"
+
+          # Archive from inside the build directory so the binary lands at the
+          # archive root with no wrapping directory (see the header comment).
+          cd "target/${TARGET}/release"
+          binary="soroban-forge${EXE}"
+          if [ ! -f "$binary" ]; then
+            echo "::error::missing built binary $binary"
+            exit 1
+          fi
+
+          if [ "$ARCHIVE_EXT" = "zip" ]; then
+            7z a -tzip "$outdir/$archive" "$binary" > /dev/null
+          else
+            tar -czf "$outdir/$archive" "$binary"
+          fi
+
+          # `sha256sum` exists on Linux and in Git Bash; macOS has `shasum`.
+          cd "$outdir"
+          if command -v sha256sum > /dev/null 2>&1; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          cat "$archive.sha256"
+
+      - name: Smoke-test the binary
+        # Native targets only: the cross-built aarch64 Linux binary cannot
+        # execute on an x86_64 runner.
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+          SOROBAN_FORGE_NO_UPDATE_CHECK: "1"
+        run: |
+          set -euo pipefail
+          binary="target/${TARGET}/release/soroban-forge${EXE}"
+          out="$("$binary" --version)"
+          echo "$out"
+          # The formula asserts its own `version` appears in `--version`
+          # output; catch a mismatch here rather than in a published release.
+          case "$out" in
+            *"$VERSION"*) ;;
+            *)
+              echo "::error::--version output '$out' does not contain '$VERSION'"
+              exit 1
+              ;;
+          esac
+          # The formula shells out to `completions` during `install` and fails
+          # the installation if it errors, so this check is strict.
+          for shell in bash zsh fish; do
+            "$binary" completions "$shell" > /dev/null
+          done
+
+          # The formula treats man pages as best-effort (`quiet_system`), so a
+          # regression here must not block a release -- warn instead.
+          if "$binary" man --out-dir "$RUNNER_TEMP/manpages" > /dev/null &&
+             [ -f "$RUNNER_TEMP/manpages/soroban-forge.1" ]; then
+            echo "man pages generated"
+          else
+            echo "::warning::\`soroban-forge man\` did not produce man pages; the formula will skip installing them"
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Publish. Tag pushes only -- a workflow_dispatch run stops after `build`,
+  # leaving the archives as downloadable run artifacts.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: publish release
+    if: github.event_name == 'push'
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to create the release and upload its assets.
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+
+      - name: Collect archives and checksums
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f -exec mv -t dist {} +
+
+          # `build` runs with fail-fast disabled, so verify every advertised
+          # platform is present before publishing: a release missing one
+          # archive leaves `brew install` broken on that platform.
+          missing=0
+          for target in \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin \
+            aarch64-unknown-linux-gnu \
+            x86_64-unknown-linux-gnu
+          do
+            if [ ! -f "dist/soroban-forge-${VERSION}-${target}.tar.gz" ]; then
+              echo "::error::missing archive for $target"
+              missing=1
+            fi
+          done
+          if [ ! -f "dist/soroban-forge-${VERSION}-x86_64-pc-windows-msvc.zip" ]; then
+            echo "::error::missing archive for x86_64-pc-windows-msvc"
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+          # One combined manifest, in `sha256sum -c` format.
+          cd dist
+          cat ./*.sha256 | sort -k2 > SHA256SUMS.txt
+          rm -f ./*.sha256
+          cat SHA256SUMS.txt
+
+      - name: Render the Homebrew formula for this release
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          bash scripts/update-homebrew-formula.sh \
+            --version "$VERSION" \
+            --checksums dist/SHA256SUMS.txt
+
+          # The script warns rather than fails on a missing checksum, but a
+          # published formula with a placeholder sha256 cannot be installed.
+          if grep -q PLACEHOLDER_SHA256_ homebrew-tap/Formula/soroban-forge.rb; then
+            echo "::error::rendered formula still contains placeholder sha256 values"
+            exit 1
+          fi
+
+          cp homebrew-tap/Formula/soroban-forge.rb dist/soroban-forge.rb
+          cat homebrew-tap/Formula/soroban-forge.rb
+
+      - name: Write release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          {
+            echo '## Install'
+            echo
+            echo '```sh'
+            echo 'brew install soroban-forge-labs/tap/soroban-forge'
+            echo '```'
+            echo
+            echo 'Or with `cargo binstall`:'
+            echo
+            echo '```sh'
+            echo 'cargo binstall soroban-forge'
+            echo '```'
+            echo
+            echo "See [docs/install-homebrew.md](https://github.com/soroban-forge-labs/soroban-forge/blob/${TAG}/docs/install-homebrew.md)"
+            echo 'for upgrade, uninstall, and shell-completion instructions.'
+            echo
+            echo 'Verify a download against `SHA256SUMS.txt`:'
+            echo
+            echo '```sh'
+            echo 'sha256sum -c SHA256SUMS.txt --ignore-missing'
+            echo '```'
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Create the GitHub release
+        env:
+          # `gh` is preinstalled on GitHub-hosted runners.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "release $TAG already exists -- uploading assets"
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "soroban-forge $VERSION" \
+              --notes-file release-notes.md \
+              --verify-tag
+          fi
+
+      # The `secrets` context is not available in a step-level `if`, so probe
+      # for the token in a step (where it is available) and gate on the result.
+      - name: Check for a tap token
+        id: tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Pushing the refreshed formula to the tap repo needs a token with write
+      # access there; GITHUB_TOKEN is scoped to this repository only. The step
+      # is skipped when the secret is absent so a release still succeeds -- the
+      # formula is attached to the release as `soroban-forge.rb` either way.
+      - name: Push the formula to the tap repository
+        if: steps.tap.outputs.enabled == 'true'
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 \
+            "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/soroban-forge-labs/homebrew-tap.git" \
+            tap
+          mkdir -p tap/Formula
+          cp homebrew-tap/Formula/soroban-forge.rb tap/Formula/soroban-forge.rb
+          cd tap
+          if git diff --quiet; then
+            echo "tap formula already up to date"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/soroban-forge.rb
+          git commit -m "soroban-forge ${VERSION}"
+          git push
+
+      - name: Summary
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TAP_TOKEN_SET: ${{ steps.tap.outputs.enabled }}
+        run: |
+          {
+            echo "## soroban-forge $VERSION published"
+            echo
+            echo '```sh'
+            echo 'brew install soroban-forge-labs/tap/soroban-forge'
+            echo '```'
+            if [ "$TAP_TOKEN_SET" != "true" ]; then
+              echo
+              echo '> `HOMEBREW_TAP_TOKEN` is not set, so the tap was not updated automatically.'
+              echo '> Copy `soroban-forge.rb` from the release assets into'
+              echo '> `soroban-forge-labs/homebrew-tap` at `Formula/soroban-forge.rb`.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

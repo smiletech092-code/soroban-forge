@@ -60,6 +60,26 @@ impl NetworkArgs {
         }
     }
 
+    /// Resolve CLI network options over project/user `[network]` defaults.
+    pub fn resolve_with_config(
+        network: Option<String>,
+        rpc_url: Option<String>,
+        network_passphrase: Option<String>,
+        config: Option<&soroban_forge_core::config::NetworkConfig>,
+    ) -> Self {
+        let cfg = config.cloned().unwrap_or_default();
+        let network = match (network.as_ref(), rpc_url.as_ref()) {
+            (Some(name), _) => Some(name.clone()),
+            (None, None) => Some(cfg.name.unwrap_or_else(|| DEFAULT_NETWORK.to_string())),
+            (None, Some(_)) => cfg.name,
+        };
+        Self {
+            network,
+            rpc_url: rpc_url.or(cfg.rpc_url),
+            network_passphrase: network_passphrase.or(cfg.passphrase),
+        }
+    }
+
     /// The corresponding `stellar` CLI arguments.
     pub fn cli_args(&self) -> Vec<String> {
         let mut args = Vec::new();
@@ -418,8 +438,47 @@ fn run_stellar_invoke(
         Ok(s) if s.success() => Ok(()),
         Ok(s) => Err(ForgeError::Other(format!(
             "stellar contract invoke exited with status {}",
-            s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
+            s.code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".into())
         ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(ForgeError::ToolMissing("stellar-cli".into()))
+        }
+        Err(e) => Err(ForgeError::io("running stellar contract invoke")(e)),
+    }
+}
+
+/// Return the stable envelope emitted by `--json invoke`. If stellar-cli
+/// already returns JSON, preserve its type; otherwise retain its text result.
+pub fn json_invoke_envelope(stdout: &str, success: bool) -> serde_json::Value {
+    let trimmed = stdout.trim();
+    let result = serde_json::from_str::<serde_json::Value>(trimmed)
+        .unwrap_or_else(|_| serde_json::Value::String(trimmed.to_string()));
+    serde_json::json!({ "success": success, "result": result })
+}
+
+/// JSON-mode invocation captures stellar-cli output so the forge command can
+/// emit one machine-readable envelope. Non-JSON mode intentionally continues
+/// to use [`run_stellar_invoke`] and stream directly to the terminal.
+fn run_stellar_invoke_json(
+    contract_id: &str,
+    source: &str,
+    network: &NetworkArgs,
+    function: &str,
+    fn_args: &[String],
+    cwd: &Path,
+    timeout: Option<Duration>,
+) -> Result<serde_json::Value> {
+    let args = build_invoke_args(contract_id, source, network, function, fn_args);
+    let mut command = std::process::Command::new("stellar");
+    command.args(&args).current_dir(cwd);
+    let output = soroban_forge_core::timeout::output_with_timeout(&mut command, timeout);
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            Ok(json_invoke_envelope(&stdout, out.status.success()))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Err(ForgeError::ToolMissing("stellar-cli".into()))
         }
@@ -446,14 +505,16 @@ impl ForgePlugin for InvokePlugin {
                 "Call a function on a deployed contract with `stellar contract invoke`.\n\n\
                  Everything after <FN> is forwarded verbatim as that function's arguments, \
                  so --source/--network/etc. must be given before <CONTRACT_ID> and <FN>:\n\n  \
-                 soroban-forge invoke --source alice <CONTRACT_ID> transfer --to G... --amount 100",
+                 soroban-forge invoke --source alice <CONTRACT_ID> transfer --to G... --amount 100\n\n\
+                 When <CONTRACT_ID> is omitted, the most recently deployed contract ID recorded \
+                 in deployments.json (written by `soroban-forge deploy`) is used.",
             )
             .trailing_var_arg(true)
             .arg(
                 Arg::new("contract-id")
-                    .required(true)
+                    .required(false)
                     .value_name("CONTRACT_ID")
-                    .help("Deployed contract ID (C…)"),
+                    .help("Deployed contract ID (C…); omit to fall back to the last ID in deployments.json"),
             )
             .arg(
                 Arg::new("function")
@@ -473,9 +534,8 @@ impl ForgePlugin for InvokePlugin {
                 Arg::new("source")
                     .long("source")
                     .short('s')
-                    .required(true)
                     .value_name("IDENTITY")
-                    .help("Source account/identity that signs the invocation"),
+                    .help("Source account/identity that signs the invocation [default: config identity.default]"),
             )
             .arg(
                 Arg::new("network")
@@ -492,6 +552,11 @@ impl ForgePlugin for InvokePlugin {
                 Arg::new("network-passphrase")
                     .long("network-passphrase")
                     .help("Network passphrase for --rpc-url"),
+            )
+            .arg(
+                Arg::new("path")
+                    .long("path")
+                    .help("Contract project directory for deployments.json lookup [default: current directory]"),
             )
             .arg(
                 Arg::new("args-file")
@@ -522,14 +587,40 @@ impl ForgePlugin for InvokePlugin {
         // conceptually; in practice it still needs a live RPC endpoint.
         if ctx.offline && !simulate {
             return Err(ForgeError::InvalidArgument(
-                "invoke is unavailable in offline mode because it calls a deployed contract"
-                    .into(),
+                "invoke is unavailable in offline mode because it calls a deployed contract".into(),
             ));
         }
 
-        let contract_id = matches
-            .get_one::<String>("contract-id")
-            .expect("contract-id is required by clap");
+        let network = NetworkArgs::resolve_with_config(
+            matches.get_one::<String>("network").cloned(),
+            matches.get_one::<String>("rpc-url").cloned(),
+            matches.get_one::<String>("network-passphrase").cloned(),
+            ctx.config.as_ref().map(|config| &config.network),
+        );
+
+        // Issue #281: fall back to the recorded contract ID when none is given.
+        let contract_id = match matches.get_one::<String>("contract-id") {
+            Some(id) => id.clone(),
+            None => {
+                let dir = matches
+                    .get_one::<String>("path")
+                    .map(|p| ctx.cwd.join(p))
+                    .unwrap_or_else(|| ctx.cwd.clone());
+                soroban_forge_deploy::lookup_recorded_contract_id(
+                    &dir,
+                    &soroban_forge_deploy::read_crate_name(&dir).unwrap_or_default(),
+                    &network.network.clone().unwrap_or_else(|| DEFAULT_NETWORK.to_string()),
+                )
+                .ok_or_else(|| {
+                    ForgeError::InvalidArgument(
+                        "no contract-id given and no deployment recorded in deployments.json — \
+                         run `soroban-forge deploy` first or pass a contract ID explicitly"
+                            .into(),
+                    )
+                })?
+            }
+        };
+
         let function = matches
             .get_one::<String>("function")
             .expect("function is required by clap");
@@ -540,13 +631,18 @@ impl ForgePlugin for InvokePlugin {
             .collect();
         let source = matches
             .get_one::<String>("source")
-            .expect("source is required by clap");
-
-        let network = NetworkArgs::resolve(
-            matches.get_one::<String>("network").cloned(),
-            matches.get_one::<String>("rpc-url").cloned(),
-            matches.get_one::<String>("network-passphrase").cloned(),
-        );
+            .cloned()
+            .or_else(|| {
+                ctx.config
+                    .as_ref()
+                    .and_then(|config| config.identity.default.clone())
+            })
+            .ok_or_else(|| {
+                ForgeError::InvalidArgument(
+                    "missing source identity: pass --source or set [identity].default in config"
+                        .into(),
+                )
+            })?;
 
         // Issue #284: merge --args-file with inline args (inline wins).
         let fn_args = if let Some(args_path) = matches.get_one::<String>("args-file") {
@@ -560,8 +656,8 @@ impl ForgePlugin for InvokePlugin {
             // Issue #285: simulate and pretty-print.
             let sim =
                 run_stellar_simulate(
-                contract_id,
-                source,
+                &contract_id,
+                &source,
                 &network,
                 function,
                 &fn_args,
@@ -614,15 +710,34 @@ impl ForgePlugin for InvokePlugin {
             return Ok(());
         }
 
-        run_stellar_invoke(
-            contract_id,
-            source,
-            &network,
-            function,
-            &fn_args,
-            &ctx.cwd,
-            ctx.timeout(),
-        )
+        if ctx.json {
+            let result = run_stellar_invoke_json(
+                &contract_id,
+                &source,
+                &network,
+                function,
+                &fn_args,
+                &ctx.cwd,
+                ctx.timeout(),
+            )?;
+            let success = result["success"].as_bool().unwrap_or(false);
+            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            if success {
+                Ok(())
+            } else {
+                Err(ForgeError::Other("stellar contract invoke failed".into()))
+            }
+        } else {
+            run_stellar_invoke(
+                &contract_id,
+                &source,
+                &network,
+                function,
+                &fn_args,
+                &ctx.cwd,
+                ctx.timeout(),
+            )
+        }
     }
 }
 
@@ -638,6 +753,29 @@ mod tests {
     fn defaults_to_testnet() {
         let network = NetworkArgs::resolve(None, None, None);
         assert_eq!(network.cli_args(), vec!["--network", "testnet"]);
+    }
+
+    #[test]
+    fn configured_network_defaults_are_used_but_cli_wins() {
+        let config = soroban_forge_core::config::NetworkConfig {
+            name: Some("mainnet".into()),
+            rpc_url: Some("https://configured.example".into()),
+            passphrase: Some("configured passphrase".into()),
+        };
+        let configured = NetworkArgs::resolve_with_config(None, None, None, Some(&config));
+        assert_eq!(configured.network.as_deref(), Some("mainnet"));
+        assert_eq!(configured.rpc_url.as_deref(), Some("https://configured.example"));
+        assert_eq!(configured.network_passphrase.as_deref(), Some("configured passphrase"));
+
+        let cli = NetworkArgs::resolve_with_config(
+            Some("testnet".into()),
+            Some("https://cli.example".into()),
+            Some("cli passphrase".into()),
+            Some(&config),
+        );
+        assert_eq!(cli.network.as_deref(), Some("testnet"));
+        assert_eq!(cli.rpc_url.as_deref(), Some("https://cli.example"));
+        assert_eq!(cli.network_passphrase.as_deref(), Some("cli passphrase"));
     }
 
     #[test]
@@ -665,6 +803,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn json_invoke_output_is_a_parseable_envelope() {
+        let envelope = json_invoke_envelope(r#"{"amount":"42"}"#, true);
+        let encoded = serde_json::to_string(&envelope).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["result"]["amount"], "42");
+
+        let text = json_invoke_envelope("plain stellar output", true);
+        assert_eq!(text["result"], "plain stellar output");
+    }
+
     // -----------------------------------------------------------------------
     // build_invoke_args
     // -----------------------------------------------------------------------
@@ -677,15 +827,30 @@ mod tests {
             "alice",
             &network,
             "transfer",
-            &["--to".to_string(), "GABC".to_string(), "--amount".to_string(), "100".to_string()],
+            &[
+                "--to".to_string(),
+                "GABC".to_string(),
+                "--amount".to_string(),
+                "100".to_string(),
+            ],
         );
         assert_eq!(
             args,
             vec![
-                "contract", "invoke", "--id",
+                "contract",
+                "invoke",
+                "--id",
                 "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "--source", "alice", "--network", "testnet", "--",
-                "transfer", "--to", "GABC", "--amount", "100",
+                "--source",
+                "alice",
+                "--network",
+                "testnet",
+                "--",
+                "transfer",
+                "--to",
+                "GABC",
+                "--amount",
+                "100",
             ]
         );
     }
@@ -911,10 +1076,7 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(matches.get_one::<String>("source").unwrap(), "alice");
-        assert_eq!(
-            matches.get_one::<String>("function").unwrap(),
-            "transfer"
-        );
+        assert_eq!(matches.get_one::<String>("function").unwrap(), "transfer");
         let args: Vec<&String> = matches.get_many::<String>("args").unwrap().collect();
         assert_eq!(args, vec!["--to", "GABC", "--amount", "100"]);
     }

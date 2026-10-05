@@ -132,29 +132,85 @@ pub fn build_bench(info: &ContractInfo) -> String {
     out
 }
 
-/// Appends the `[[bench]]` target and criterion dev-dependency to the
-/// project's `Cargo.toml`.
+/// Returns true if the manifest declares `criterion` as a dependency or dev-dependency.
+pub fn has_criterion_dependency(manifest: &str) -> bool {
+    if let Ok(val) = toml::from_str::<toml::Value>(manifest) {
+        if let Some(dev_deps) = val.get("dev-dependencies").and_then(|d| d.as_table()) {
+            if dev_deps.contains_key("criterion") {
+                return true;
+            }
+        }
+        if let Some(deps) = val.get("dependencies").and_then(|d| d.as_table()) {
+            if deps.contains_key("criterion") {
+                return true;
+            }
+        }
+        if let Some(target) = val.get("target").and_then(|t| t.as_table()) {
+            for target_val in target.values() {
+                if let Some(target_dev_deps) = target_val.get("dev-dependencies").and_then(|d| d.as_table()) {
+                    if target_dev_deps.contains_key("criterion") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    manifest.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("criterion =") || trimmed.starts_with("criterion=")
+    }) || manifest.contains("[dev-dependencies.criterion]")
+}
+
+/// Returns true if the manifest declares a `forge_bench` bench target.
+pub fn has_forge_bench_target(manifest: &str) -> bool {
+    if let Ok(val) = toml::from_str::<toml::Value>(manifest) {
+        if let Some(benches) = val.get("bench").and_then(|b| b.as_array()) {
+            if benches.iter().any(|b| b.get("name").and_then(|n| n.as_str()) == Some("forge_bench")) {
+                return true;
+            }
+        }
+    }
+    manifest.contains("name = \"forge_bench\"") || manifest.contains("name = 'forge_bench'")
+}
+
+/// The exact snippet to add to `Cargo.toml` for criterion and the bench target.
+pub fn bench_cargo_snippet() -> &'static str {
+    BENCH_CARGO_FRAGMENT.trim()
+}
+
+/// Appends the `[[bench]]` target and/or criterion dev-dependency to the
+/// project's `Cargo.toml` if either is missing.
 ///
-/// Returns `true` when the manifest was changed. Appending is skipped when a
-/// `forge_bench` target is already declared, so re-running `--bench` does not
-/// duplicate the section.
+/// Returns `Some(updated)` when the manifest was changed, or `None` if both
+/// the `criterion` dependency and `forge_bench` target are already configured.
 pub fn ensure_bench_target(manifest: &str) -> Option<String> {
-    if manifest.contains("name = \"forge_bench\"") {
+    let has_crit = has_criterion_dependency(manifest);
+    let has_bench = has_forge_bench_target(manifest);
+
+    if has_crit && has_bench {
         return None;
     }
 
     let mut updated = manifest.trim_end().to_string();
     updated.push('\n');
 
-    // A project that already has `[dev-dependencies]` gets criterion added to
-    // it; emitting a second section would make cargo reject the manifest.
-    if manifest.contains("[dev-dependencies]") {
-        updated.push_str(
-            "\ncriterion = { version = \"0.5\", default-features = false, features = [\"cargo_bench_support\"] }\n\
-             \n[[bench]]\nname = \"forge_bench\"\nharness = false\n",
-        );
-    } else {
-        updated.push_str(BENCH_CARGO_FRAGMENT);
+    const CRITERION_LINE: &str = "criterion = { version = \"0.5\", default-features = false, features = [\"cargo_bench_support\"] }";
+    const BENCH_SECTION: &str = "[[bench]]\nname = \"forge_bench\"\nharness = false";
+
+    if !has_crit && !has_bench {
+        if manifest.contains("[dev-dependencies]") {
+            updated.push_str(&format!("\n{CRITERION_LINE}\n\n{BENCH_SECTION}\n"));
+        } else {
+            updated.push_str(&format!("\n[dev-dependencies]\n{CRITERION_LINE}\n\n{BENCH_SECTION}\n"));
+        }
+    } else if !has_crit && has_bench {
+        if manifest.contains("[dev-dependencies]") {
+            updated.push_str(&format!("\n{CRITERION_LINE}\n"));
+        } else {
+            updated.push_str(&format!("\n[dev-dependencies]\n{CRITERION_LINE}\n"));
+        }
+    } else if has_crit && !has_bench {
+        updated.push_str(&format!("\n{BENCH_SECTION}\n"));
     }
 
     Some(updated)
@@ -224,7 +280,10 @@ mod tests {
 
     #[test]
     fn defaults_entrypoint_arguments() {
-        let info = info_with(vec![method("mint", &[("to", "Address"), ("amount", "i128")])]);
+        let info = info_with(vec![method(
+            "mint",
+            &[("to", "Address"), ("amount", "i128")],
+        )]);
         let rendered = build_bench(&info);
         assert!(rendered.contains("client.mint(&common::new_account(&env), &0_i128)"));
     }
@@ -265,5 +324,101 @@ mod tests {
         let manifest = "[package]\nname = \"demo\"\n";
         let once = ensure_bench_target(manifest).expect("manifest changed");
         assert!(ensure_bench_target(&once).is_none());
+    }
+
+    #[test]
+    fn bench_target_already_configured_is_unchanged() {
+        let manifest = r#"[package]
+name = "demo"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "forge_bench"
+harness = false
+"#;
+        assert!(ensure_bench_target(manifest).is_none());
+    }
+
+    #[test]
+    fn missing_config_adds_both_criterion_and_bench() {
+        let manifest = r#"[package]
+name = "demo"
+"#;
+        let updated = ensure_bench_target(manifest).expect("manifest should be updated");
+        assert!(updated.contains("[dev-dependencies]"));
+        assert!(updated.contains("criterion ="));
+        assert!(updated.contains("[[bench]]"));
+        assert!(updated.contains("name = \"forge_bench\""));
+    }
+
+    #[test]
+    fn missing_criterion_only_adds_criterion() {
+        let manifest = r#"[package]
+name = "demo"
+
+[[bench]]
+name = "forge_bench"
+harness = false
+"#;
+        let updated = ensure_bench_target(manifest).expect("manifest should add missing criterion");
+        assert!(updated.contains("criterion ="));
+        assert_eq!(updated.matches("name = \"forge_bench\"").count(), 1);
+    }
+
+    #[test]
+    fn missing_bench_only_adds_bench() {
+        let manifest = r#"[package]
+name = "demo"
+
+[dev-dependencies]
+criterion = "0.5"
+"#;
+        let updated = ensure_bench_target(manifest).expect("manifest should add missing bench");
+        assert!(updated.contains("[[bench]]"));
+        assert!(updated.contains("name = \"forge_bench\""));
+        assert_eq!(updated.matches("[dev-dependencies]").count(), 1);
+        assert_eq!(updated.matches("criterion =").count(), 1);
+    }
+
+    #[test]
+    fn snippet_provides_exact_cargo_fragment() {
+        let snippet = bench_cargo_snippet();
+        assert!(snippet.contains("criterion ="));
+        assert!(snippet.contains("[[bench]]"));
+        assert!(snippet.contains("name = \"forge_bench\""));
+    }
+
+    #[test]
+    fn write_bench_files_updates_unconfigured_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("Cargo.toml");
+        std::fs::write(&manifest_path, "[package]\nname = \"test-contract\"\n").unwrap();
+        let info = info_with(vec![method("increment", &[])]);
+
+        let written = crate::write_bench_files(dir.path(), &info, false).unwrap();
+        assert!(written.contains(&"benches/forge_bench.rs"));
+        assert!(written.contains(&"Cargo.toml"));
+
+        let updated_manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(updated_manifest.contains("criterion ="));
+        assert!(updated_manifest.contains("[[bench]]"));
+    }
+
+    #[test]
+    fn write_bench_files_skips_already_configured_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &manifest_path,
+            "[package]\nname = \"test-contract\"\n\n[dev-dependencies]\ncriterion = \"0.5\"\n\n[[bench]]\nname = \"forge_bench\"\nharness = false\n",
+        )
+        .unwrap();
+        let info = info_with(vec![method("increment", &[])]);
+
+        let written = crate::write_bench_files(dir.path(), &info, false).unwrap();
+        assert!(written.contains(&"benches/forge_bench.rs"));
+        assert!(!written.contains(&"Cargo.toml"));
     }
 }

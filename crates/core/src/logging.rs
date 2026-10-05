@@ -72,6 +72,14 @@ impl Log for ForgeLogger {
 /// the default `info` level, `1` (`-v`) raises it to `debug`, and `2+`
 /// (`-vv`) raises it to `trace`.
 pub fn init(verbose: u8, log_file: Option<&Path>) -> Result<()> {
+    init_with_color(verbose, log_file, true)
+}
+
+/// Like [`init`], but with explicit color control.
+///
+/// When `use_color` is `false` the console logger writes plain text with no
+/// ANSI escape sequences, honoring `NO_COLOR` / `--color never`.
+pub fn init_with_color(verbose: u8, log_file: Option<&Path>, use_color: bool) -> Result<()> {
     let level = match verbose {
         0 => "info",
         1 => "debug",
@@ -80,6 +88,9 @@ pub fn init(verbose: u8, log_file: Option<&Path>) -> Result<()> {
     let mut builder =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level));
     builder.format_timestamp(None);
+    if !use_color {
+        builder.write_style(env_logger::WriteStyle::Never);
+    }
     let console = builder.build();
     let max_level = console.filter();
 
@@ -87,7 +98,10 @@ pub fn init(verbose: u8, log_file: Option<&Path>) -> Result<()> {
         .map(|path| {
             File::create(path)
                 .map(Mutex::new)
-                .map_err(ForgeError::io(format!("creating log file {}", path.display())))
+                .map_err(ForgeError::io(format!(
+                    "creating log file {}",
+                    path.display()
+                )))
         })
         .transpose()?;
 

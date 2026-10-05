@@ -211,10 +211,7 @@ mod tests {
 
     #[test]
     fn describe_lists_one_per_line() {
-        let all = vec![
-            candidate("a", "contracts/a"),
-            candidate("b", "contracts/b"),
-        ];
+        let all = vec![candidate("a", "contracts/a"), candidate("b", "contracts/b")];
         assert_eq!(describe(&all), "  a (contracts/a)\n  b (contracts/b)");
     }
 }

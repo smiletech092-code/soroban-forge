@@ -1,0 +1,25 @@
+# multi-token
+
+A multi-token (ERC1155-style) smart contract for Stellar/Soroban, generated with [soroban-forge](https://github.com/soroban-forge-labs/soroban-forge).
+
+Manages many token ids with independent per-id, per-owner balances in a single contract instance — supports admin-gated minting, transfers, and burning, both one id at a time and in batches.
+
+## Commands
+
+\`\`\`sh
+# Run unit tests
+cargo test
+
+# Build the release WASM file
+stellar contract build
+
+# Deploy to Testnet
+stellar contract deploy \
+  --wasm target/wasm32v1-none/release/multi_token.wasm \
+  --source <your-identity> \
+  --network testnet
+\`\`\`
+
+## Security
+
+This template is a starting point, not audited code. See [security-considerations.md](https://github.com/soroban-forge-labs/soroban-forge/blob/main/docs/security-considerations.md) for what it does and does not protect against.

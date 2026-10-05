@@ -293,10 +293,7 @@ pub fn build_roundtrip_tests(info: &ContractInfo) -> String {
                 }
 
                 let binding_name = format!("{}_value", arg.name);
-                let binding = format!(
-                    "    let {binding_name} = {};",
-                    literal(&arg.kind, case)
-                );
+                let binding = format!("    let {binding_name} = {};", literal(&arg.kind, case));
 
                 let mut vars = Vars::new();
                 vars.insert("contract_type".into(), contract_type.clone());
@@ -403,7 +400,15 @@ mod tests {
             element: "u32".into(),
         };
         assert_eq!(literal(&vec_kind, "empty"), "soroban_sdk::vec![&env]");
-        assert_eq!(literal(&ContainerKind::Option { inner: "u32".into() }, "empty"), "None");
+        assert_eq!(
+            literal(
+                &ContainerKind::Option {
+                    inner: "u32".into()
+                },
+                "empty"
+            ),
+            "None"
+        );
         assert_eq!(
             literal(
                 &ContainerKind::Map {

@@ -10,9 +10,14 @@
 //! - `git` (recommended, not required), and its `user.name`/`user.email`
 //!   identity, without which the first commit in a new project fails
 //! - Docker (optional, used for reproducible wasm builds)
+//! - free disk space (optional warning when below 1 GiB, since wasm/target builds can be large)
 //! - when run inside a contract project: the project's `soroban-sdk`
-//!   version, compared against the version pinned into new projects
-//!   (`soroban_forge_scaffold::SOROBAN_SDK_VERSION`)
+//!   version, compared against the latest stable version published on
+//!   crates.io (falling back to the version pinned into new projects when
+//!   crates.io cannot be reached)
+//! - when run inside a cargo project: a `Cargo.lock` that version control
+//!   will carry, since a missing or gitignored lockfile leaves CI resolving
+//!   fresh dependency versions on every build
 //!
 //! With `--fix`, doctor will, after confirmation, run the subset of remedies
 //! that are safe to automate (`rustup target add`, `cargo install`), then
@@ -34,6 +39,9 @@ pub use soroban_forge_core::toolchain::{parse_semverish, version_at_least};
 
 /// Default Soroban RPC endpoint used for the connectivity check.
 pub const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
+
+/// Minimum recommended free disk space (in bytes) for building Soroban contracts and target artifacts (1 GiB).
+pub const MIN_FREE_DISK_SPACE_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 
 /// Outcome of a single environment check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,47 +124,81 @@ fn dep_version(dep: &toml::Value) -> Option<String> {
     }
 }
 
-/// Check the project's `soroban-sdk` version against the version pinned into
-/// freshly scaffolded projects.
+/// Fetch the latest stable `soroban-sdk` version published on crates.io.
+///
+/// This check is advisory, so registry/network errors are intentionally
+/// ignored by the caller and fall back to the version pinned in templates.
+fn latest_published_sdk_version() -> Option<String> {
+    let response = ureq::get("https://crates.io/api/v1/crates/soroban-sdk")
+        .set("User-Agent", "soroban-forge")
+        .timeout(std::time::Duration::from_secs(3))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    let body: serde_json::Value = serde_json::from_str(&response).ok()?;
+    let krate = body.get("crate")?;
+    let version = krate
+        .get("max_stable_version")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| krate.get("max_version").and_then(serde_json::Value::as_str))?;
+    parse_semverish(version).map(|_| version.to_owned())
+}
+
+/// Check the project's `soroban-sdk` version against the latest published
+/// stable version (or the template pin when the registry is unavailable).
 ///
 /// Returns `None` (no report line at all) when `project_dir` does not look
 /// like a contract project: no readable/parseable `Cargo.toml`, or a
 /// manifest without a `soroban-sdk` dependency. Otherwise:
 ///
-/// - `Pass` when the declared version is at or above the pinned one
+/// - `Pass` when the declared version is at or above the latest version
 /// - `Warn` when it is behind, unversioned, or unparseable
 pub fn sdk_version_check(project_dir: &Path) -> Option<Check> {
+    sdk_version_check_with(project_dir, latest_published_sdk_version)
+}
+
+fn sdk_version_check_with(
+    project_dir: &Path,
+    latest_version: impl FnOnce() -> Option<String>,
+) -> Option<Check> {
     let contents = std::fs::read_to_string(project_dir.join("Cargo.toml")).ok()?;
     let manifest: toml::Value = toml::from_str(&contents).ok()?;
     let declared = manifest_sdk_version(&manifest)?;
-    let pinned = parse_semverish(SOROBAN_SDK_VERSION)?;
+    let latest = latest_version().filter(|version| parse_semverish(version).is_some());
+    let latest_available = latest.is_some();
+    let latest = latest.unwrap_or_else(|| SOROBAN_SDK_VERSION.to_owned());
+    let latest_parsed = parse_semverish(&latest)?;
+    let latest_label = if latest_available {
+        format!("latest: {latest}")
+    } else {
+        format!("latest published unavailable; template pin: {latest}")
+    };
 
     Some(match declared {
         None => Check {
             name: "soroban-sdk",
             status: Status::Warn,
-            detail: format!("no version specified (latest pinned: {SOROBAN_SDK_VERSION})"),
+            detail: format!("no version specified ({latest_label})"),
             fix: Some("pin a soroban-sdk version in Cargo.toml"),
         },
         Some(raw) => match parse_semverish(&raw) {
-            Some(found) if found >= pinned => Check {
+            Some(found) if found >= latest_parsed => Check {
                 name: "soroban-sdk",
                 status: Status::Pass,
-                detail: format!("soroban-sdk {raw}"),
+                detail: format!("soroban-sdk {raw} ({latest_label})"),
                 fix: None,
             },
             Some(_) => Check {
                 name: "soroban-sdk",
                 status: Status::Warn,
-                detail: format!("soroban-sdk {raw} (latest pinned: {SOROBAN_SDK_VERSION})"),
+                detail: format!("soroban-sdk {raw} ({latest_label})"),
                 fix: Some("update the soroban-sdk version in Cargo.toml"),
             },
             None => Check {
                 name: "soroban-sdk",
                 status: Status::Warn,
-                detail: format!(
-                    "could not parse version `{raw}` (latest pinned: {SOROBAN_SDK_VERSION})"
-                ),
+                detail: format!("could not parse version `{raw}` ({latest_label})"),
                 fix: Some("pin a concrete soroban-sdk version in Cargo.toml"),
             },
         },
@@ -421,6 +463,160 @@ pub fn git_identity_check() -> Check {
     classify_git_identity(name.as_deref(), email.as_deref())
 }
 
+/// Format a byte count into a human-readable string (e.g. `1.2 GB`, `500.0 MB`).
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * KB;
+    const GB: f64 = 1024.0 * MB;
+    const TB: f64 = 1024.0 * GB;
+
+    let b = bytes as f64;
+    if b >= TB {
+        format!("{:.1} TB", b / TB)
+    } else if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Query available disk space (in bytes) for the filesystem containing `path`.
+#[cfg(windows)]
+pub fn available_disk_space(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut target_dir = path;
+    while !target_dir.exists() {
+        if let Some(parent) = target_dir.parent() {
+            if parent.as_os_str().is_empty() {
+                target_dir = Path::new(".");
+                break;
+            }
+            target_dir = parent;
+        } else {
+            target_dir = Path::new(".");
+            break;
+        }
+    }
+
+    let mut wide: Vec<u16> = target_dir.as_os_str().encode_wide().collect();
+    wide.push(0);
+
+    let mut free_bytes: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut total_free_bytes: u64 = 0;
+
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+
+    let ret = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_bytes,
+            &mut total_bytes,
+            &mut total_free_bytes,
+        )
+    };
+
+    if ret != 0 {
+        Some(free_bytes)
+    } else {
+        None
+    }
+}
+
+/// Query available disk space (in bytes) for the filesystem containing `path`.
+#[cfg(unix)]
+pub fn available_disk_space(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut target_dir = path;
+    while !target_dir.exists() {
+        if let Some(parent) = target_dir.parent() {
+            if parent.as_os_str().is_empty() {
+                target_dir = Path::new(".");
+                break;
+            }
+            target_dir = parent;
+        } else {
+            target_dir = Path::new(".");
+            break;
+        }
+    }
+
+    let c_path = CString::new(target_dir.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if ret == 0 {
+        let block_size = if stat.f_frsize > 0 {
+            stat.f_frsize as u64
+        } else {
+            stat.f_bsize as u64
+        };
+        Some(stat.f_bavail as u64 * block_size)
+    } else {
+        None
+    }
+}
+
+/// Query available disk space (in bytes) for the filesystem containing `path`.
+#[cfg(not(any(windows, unix)))]
+pub fn available_disk_space(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// Classify an available disk space probe into a report line.
+///
+/// Wasm and target builds can consume significant disk space. Low disk space is a
+/// [`Status::Warn`], never a [`Status::Fail`].
+pub fn classify_disk_space(available_bytes: Option<u64>, threshold_bytes: u64) -> Check {
+    match available_bytes {
+        Some(bytes) if bytes >= threshold_bytes => Check {
+            name: "disk space",
+            status: Status::Pass,
+            detail: format!("{} free", format_bytes(bytes)),
+            fix: None,
+        },
+        Some(bytes) => Check {
+            name: "disk space",
+            status: Status::Warn,
+            detail: format!(
+                "{} free (low; recommended >= {} for wasm/target builds)",
+                format_bytes(bytes),
+                format_bytes(threshold_bytes)
+            ),
+            fix: Some(
+                "free up disk space on the active drive (target and wasm builds can be large)",
+            ),
+        },
+        None => Check {
+            name: "disk space",
+            status: Status::Warn,
+            detail: "could not determine available disk space".into(),
+            fix: Some("verify filesystem permissions or check disk space manually"),
+        },
+    }
+}
+
+/// Report available disk space for `path` against [`MIN_FREE_DISK_SPACE_BYTES`].
+///
+/// Thin system-touching wrapper around [`classify_disk_space`].
+pub fn disk_space_check(path: &Path) -> Check {
+    let available = available_disk_space(path);
+    classify_disk_space(available, MIN_FREE_DISK_SPACE_BYTES)
+}
+
 /// Check whether `url` is reachable with an HTTP GET, returning latency in ms.
 ///
 /// Uses `curl` as a subprocess to avoid pulling in an HTTP client dependency.
@@ -567,6 +763,104 @@ pub fn release_profile_checks(project_dir: &Path) -> Vec<Check> {
     checks
 }
 
+/// Whether git excludes the project's `Cargo.lock` from version control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockIgnored {
+    /// An ignore rule matches the lockfile and nothing has committed it.
+    Yes,
+    /// No ignore rule excludes it — including the case of a lockfile already
+    /// tracked, which git carries regardless of a matching rule.
+    No,
+    /// Could not tell: git is missing, or this is not a repository.
+    Unknown,
+}
+
+/// Classify a `Cargo.lock` probe into a report line.
+///
+/// A committed lockfile is what makes CI resolve the same dependency versions
+/// the contract was tested and audited against; without one, every build picks
+/// up whatever has been published since. That is a [`Status::Warn`] rather
+/// than a [`Status::Fail`] — the project still builds, just not reproducibly.
+///
+/// `present` is whether the file exists on disk; `ignored` is git's verdict on
+/// whether version control would carry it.
+pub fn classify_cargo_lock(present: bool, ignored: LockIgnored) -> Check {
+    match (present, ignored) {
+        (true, LockIgnored::Yes) => Check {
+            name: "Cargo.lock",
+            status: Status::Warn,
+            detail: "present but excluded by .gitignore — CI never sees it".into(),
+            fix: Some(
+                "remove the Cargo.lock entry from .gitignore, then: \
+                 git add -f Cargo.lock && git commit -m \"commit Cargo.lock\"",
+            ),
+        },
+        (true, LockIgnored::No) => Check {
+            name: "Cargo.lock",
+            status: Status::Pass,
+            detail: "present, and no ignore rule excludes it".into(),
+            fix: None,
+        },
+        (true, LockIgnored::Unknown) => Check {
+            name: "Cargo.lock",
+            status: Status::Pass,
+            detail: "present".into(),
+            fix: None,
+        },
+        (false, LockIgnored::Yes) => Check {
+            name: "Cargo.lock",
+            status: Status::Warn,
+            detail: "not found, and .gitignore excludes it".into(),
+            fix: Some(
+                "remove the Cargo.lock entry from .gitignore, then: \
+                 cargo generate-lockfile && git add Cargo.lock",
+            ),
+        },
+        (false, _) => Check {
+            name: "Cargo.lock",
+            status: Status::Warn,
+            detail: "not found — CI resolves fresh dependency versions".into(),
+            fix: Some("cargo generate-lockfile, then commit Cargo.lock"),
+        },
+    }
+}
+
+/// Ask git whether an ignore rule excludes `Cargo.lock` in `project_dir`.
+///
+/// `git check-ignore --quiet` answers in its exit status: 0 when a rule
+/// matches, 1 when none does, 128 outside a repository. A tracked file counts
+/// as *not* ignored even when a rule matches it, which is exactly the question
+/// asked here — a lockfile already in the index is version-controlled whatever
+/// `.gitignore` says.
+fn lock_ignored(project_dir: &Path) -> LockIgnored {
+    let output = std::process::Command::new("git")
+        .args(["check-ignore", "--quiet", "Cargo.lock"])
+        .current_dir(project_dir)
+        .output();
+    match output {
+        Ok(o) => match o.status.code() {
+            Some(0) => LockIgnored::Yes,
+            Some(1) => LockIgnored::No,
+            _ => LockIgnored::Unknown,
+        },
+        Err(_) => LockIgnored::Unknown,
+    }
+}
+
+/// Report whether the project has a `Cargo.lock` that version control carries.
+///
+/// Returns `None` (no report line at all) when `project_dir` is not a cargo
+/// project — there is no lockfile to expect.
+///
+/// Thin system-touching wrapper around [`classify_cargo_lock`].
+pub fn cargo_lock_check(project_dir: &Path) -> Option<Check> {
+    if !project_dir.join("Cargo.toml").is_file() {
+        return None;
+    }
+    let present = project_dir.join("Cargo.lock").is_file();
+    Some(classify_cargo_lock(present, lock_ignored(project_dir)))
+}
+
 /// Run a fast `cargo build --target wasm32v1-none` in `project_dir` and
 /// report whether it succeeds, with timing.
 ///
@@ -607,42 +901,6 @@ pub fn wasm_build_check(project_dir: &Path) -> Option<Check> {
             fix: Some("install Rust: https://rustup.rs"),
         },
     })
-}
-
-/// Warn when `Cargo.toml` has been changed since the lockfile was updated.
-///
-/// A missing lockfile is checked separately: the project is not stale, it just
-/// doesn't have a lockfile to compare yet. This keeps the warning focused and
-/// avoids double-reporting the same issue.
-pub fn cargo_lock_check(project_dir: &Path) -> Option<Check> {
-    let cargo_toml = project_dir.join("Cargo.toml");
-    if !cargo_toml.is_file() {
-        return None;
-    }
-
-    let cargo_lock = project_dir.join("Cargo.lock");
-    if !cargo_lock.is_file() {
-        return Some(Check {
-            name: "Cargo.lock",
-            status: Status::Warn,
-            detail: "missing; run cargo check to generate it".into(),
-            fix: Some("run cargo check to generate Cargo.lock"),
-        });
-    }
-
-    let toml_mtime = std::fs::metadata(cargo_toml).ok()?.modified().ok()?;
-    let lock_mtime = std::fs::metadata(cargo_lock).ok()?.modified().ok()?;
-    if toml_mtime > lock_mtime {
-        Some(Check {
-            name: "Cargo.lock",
-            status: Status::Warn,
-            detail: "Cargo.toml is newer than Cargo.lock; run cargo update -w or cargo check"
-                .into(),
-            fix: Some("run cargo update -w (or cargo check) to refresh Cargo.lock"),
-        })
-    } else {
-        None
-    }
 }
 
 /// Run all environment checks.
@@ -714,8 +972,11 @@ pub fn run_checks_with_network(allow_network: bool) -> Vec<Check> {
             }
             Some(_) => Check {
                 name: "wasm32-unknown-unknown",
-                status: Status::Fail,
-                detail: "missing wasm32 target".into(),
+                // The legacy target is optional: wasm32v1-none is the required
+                // one and is checked separately. Missing this must not turn
+                // doctor's overall result into a failure (#484).
+                status: Status::Warn,
+                detail: "missing optional legacy wasm32 target".into(),
                 fix: Some("rustup target add wasm32-unknown-unknown"),
             },
             None => Check {
@@ -1016,11 +1277,13 @@ fn config_network_url(config: Option<&soroban_forge_core::config::ForgeConfig>) 
         return Some(url.to_owned());
     }
     let name = config.network.name.as_deref()?;
-    match name {
-        "testnet" => Some(TESTNET_RPC_URL.to_string()),
-        "futurenet" => Some("https://rpc-futurenet.stellar.org".to_string()),
-        "localnet" => Some("http://localhost:8000/soroban/rpc".to_string()),
-        _ => Some(name.to_string()),
+    // Resolve well-known names through the network crate so doctor's mapping
+    // cannot drift from the RPC URLs the rest of the toolchain uses (#485).
+    // Unknown names still fall through to the literal string, which is the
+    // only thing available for a custom network with no explicit rpc_url.
+    match soroban_forge_network::well_known(name) {
+        Some(network) => Some(network.rpc_url),
+        None => Some(name.to_string()),
     }
 }
 
@@ -1046,6 +1309,7 @@ fn list_check_names() -> Vec<&'static str> {
         "release-opt-level",
         "release-lto",
         "release-codegen-units",
+        "disk-space",
     ]
 }
 
@@ -1061,6 +1325,7 @@ impl DoctorPlugin {
     /// than the rest of the report.
     fn gather_checks(&self, ctx: &ForgeContext, do_build: bool) -> Vec<Check> {
         let mut checks = Vec::new();
+        checks.push(disk_space_check(&ctx.cwd));
         if ctx.offline {
             checks.push(Check {
                 name: "testnet RPC",
@@ -1076,9 +1341,16 @@ impl DoctorPlugin {
         checks.extend(run_checks_with_network(false));
         checks.push(toolchain_check(&ctx.cwd)); // issue #109
         checks.push(wasm32_target_check(&ctx.cwd)); // issue #251
-        if let Some(check) = sdk_version_check(&ctx.cwd) {
+        if let Some(check) = sdk_version_check_with(&ctx.cwd, || {
+            if ctx.offline {
+                None
+            } else {
+                latest_published_sdk_version()
+            }
+        }) {
             checks.push(check);
         }
+        // A committed lockfile, without which CI cannot reproduce a build.
         if let Some(check) = cargo_lock_check(&ctx.cwd) {
             checks.push(check);
         }
@@ -1251,6 +1523,7 @@ impl ForgePlugin for DoctorPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_forge_core::config::{ForgeConfig, NetworkConfig};
 
     #[test]
     fn version_comparison() {
@@ -1331,6 +1604,45 @@ mod tests {
         assert_eq!(failure_count(&checks), 0);
     }
 
+    #[test]
+    fn missing_legacy_wasm_target_does_not_fail_the_run() {
+        // The legacy wasm32-unknown-unknown target is optional (#484): a project
+        // that only needs wasm32v1-none must not get a non-zero exit just because
+        // the older target is absent.
+        let legacy_missing = Check {
+            name: "wasm32-unknown-unknown",
+            status: Status::Warn,
+            detail: "missing optional legacy wasm32 target".into(),
+            fix: Some("rustup target add wasm32-unknown-unknown"),
+        };
+        let required_present = Check {
+            name: "wasm32v1-none-target",
+            status: Status::Pass,
+            detail: "installed".into(),
+            fix: None,
+        };
+
+        let checks = [required_present, legacy_missing];
+
+        assert_eq!(
+            failure_count(&checks),
+            0,
+            "a missing optional legacy target must not count as a failure"
+        );
+
+        // The report still mentions the warning, but it must not be reported as
+        // a failure - the warning is informational, not blocking.
+        let report = format_report(&checks);
+        assert!(
+            report.contains("0 failure(s), 1 warning(s)"),
+            "the legacy target must be reported as a warning, not a failure: {report}"
+        );
+        assert!(
+            !report.contains('\u{2717}'),
+            "no check may render as a failure marker: {report}"
+        );
+    }
+
     // ---- wasm smoke-build check ----
 
     #[test]
@@ -1345,6 +1657,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), manifest).unwrap();
         dir
+    }
+
+    fn sdk_check_at_template_pin(project_dir: &Path) -> Option<Check> {
+        sdk_version_check_with(project_dir, || Some(SOROBAN_SDK_VERSION.into()))
     }
 
     #[test]
@@ -1377,7 +1693,7 @@ mod tests {
     #[test]
     fn no_op_without_manifest() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(sdk_version_check(dir.path()).is_none());
+        assert!(sdk_check_at_template_pin(dir.path()).is_none());
     }
 
     #[test]
@@ -1385,7 +1701,7 @@ mod tests {
         let dir = project_with_manifest(
             "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
         );
-        assert!(sdk_version_check(dir.path()).is_none());
+        assert!(sdk_check_at_template_pin(dir.path()).is_none());
     }
 
     #[test]
@@ -1393,7 +1709,7 @@ mod tests {
         let dir = project_with_manifest(
             "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nsoroban-sdk = \"25.0.0\"\n",
         );
-        let check = sdk_version_check(dir.path()).unwrap();
+        let check = sdk_check_at_template_pin(dir.path()).unwrap();
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("25.0.0"));
         assert!(check.detail.contains(SOROBAN_SDK_VERSION));
@@ -1405,8 +1721,11 @@ mod tests {
         let dir = project_with_manifest(&format!(
             "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nsoroban-sdk = \"{SOROBAN_SDK_VERSION}\"\n",
         ));
-        let check = sdk_version_check(dir.path()).unwrap();
+        let check = sdk_check_at_template_pin(dir.path()).unwrap();
         assert_eq!(check.status, Status::Pass);
+        assert!(check
+            .detail
+            .contains(&format!("latest: {SOROBAN_SDK_VERSION}")));
         assert!(check.fix.is_none());
     }
 
@@ -1415,7 +1734,10 @@ mod tests {
         let dir = project_with_manifest(
             "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nsoroban-sdk = \"99.0.0\"\n",
         );
-        assert_eq!(sdk_version_check(dir.path()).unwrap().status, Status::Pass);
+        assert_eq!(
+            sdk_check_at_template_pin(dir.path()).unwrap().status,
+            Status::Pass
+        );
     }
 
     #[test]
@@ -1423,14 +1745,17 @@ mod tests {
         let table = project_with_manifest(
             "[dependencies]\nsoroban-sdk = { version = \"25.1.2\", features = [\"testutils\"] }\n",
         );
-        let check = sdk_version_check(table.path()).unwrap();
+        let check = sdk_check_at_template_pin(table.path()).unwrap();
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("25.1.2"));
 
         let dev = project_with_manifest(&format!(
             "[dev-dependencies]\nsoroban-sdk = \"{SOROBAN_SDK_VERSION}\"\n"
         ));
-        assert_eq!(sdk_version_check(dev.path()).unwrap().status, Status::Pass);
+        assert_eq!(
+            sdk_check_at_template_pin(dev.path()).unwrap().status,
+            Status::Pass
+        );
     }
 
     #[test]
@@ -1438,9 +1763,104 @@ mod tests {
         let dir = project_with_manifest(
             "[dependencies]\nsoroban-sdk = { git = \"https://example.com/sdk\" }\n",
         );
-        let check = sdk_version_check(dir.path()).unwrap();
+        let check = sdk_check_at_template_pin(dir.path()).unwrap();
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("no version specified"));
+    }
+
+    #[test]
+    fn config_network_url_resolves_mainnet_to_a_real_url() {
+        let config = ForgeConfig {
+            network: NetworkConfig {
+                name: Some("mainnet".into()),
+                rpc_url: None,
+                passphrase: None,
+            },
+            ..Default::default()
+        };
+        let url = config_network_url(Some(&config)).expect("mainnet must resolve");
+        assert_ne!(
+            url, "mainnet",
+            "mainnet must not resolve to the literal network name (#485)"
+        );
+        assert!(
+            url.starts_with("http"),
+            "mainnet must resolve to a real RPC URL, got {url:?}"
+        );
+    }
+
+    #[test]
+    fn config_network_url_matches_network_crate_for_well_known_names() {
+        for name in ["testnet", "futurenet", "mainnet", "localnet"] {
+            let config = ForgeConfig {
+                network: NetworkConfig {
+                    name: Some(name.into()),
+                    rpc_url: None,
+                    passphrase: None,
+                },
+                ..Default::default()
+            };
+            let url = config_network_url(Some(&config)).expect("well-known name must resolve");
+            let expected = soroban_forge_network::well_known(name)
+                .expect("network crate must know this name")
+                .rpc_url;
+            assert_eq!(
+                url, expected,
+                "doctor and the network crate must not drift for {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_network_url_prefers_explicit_rpc_url() {
+        let config = ForgeConfig {
+            network: NetworkConfig {
+                name: Some("mainnet".into()),
+                rpc_url: Some("https://example.com/custom".into()),
+                passphrase: None,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            config_network_url(Some(&config)).as_deref(),
+            Some("https://example.com/custom")
+    fn warns_when_project_sdk_is_behind_latest_published() {
+        let dir = project_with_manifest(
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nsoroban-sdk = \"26.1.0\"\n",
+        );
+        let check = sdk_version_check_with(dir.path(), || Some("27.0.0".into())).unwrap();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("soroban-sdk 26.1.0"));
+        assert!(check.detail.contains("latest: 27.0.0"));
+        assert_eq!(
+            check.fix,
+            Some("update the soroban-sdk version in Cargo.toml")
+        );
+    }
+
+    #[test]
+    fn config_network_url_keeps_unknown_names_as_literals() {
+        let config = ForgeConfig {
+            network: NetworkConfig {
+                name: Some("my-private-net".into()),
+                rpc_url: None,
+                passphrase: None,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            config_network_url(Some(&config)).as_deref(),
+            Some("my-private-net"),
+            "an unknown name with no rpc_url has nothing else to fall back to"
+        );
+    fn falls_back_to_template_pin_when_registry_is_unavailable() {
+        let dir = project_with_manifest(&format!(
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nsoroban-sdk = \"{SOROBAN_SDK_VERSION}\"\n",
+        ));
+        let check = sdk_version_check_with(dir.path(), || None).unwrap();
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.detail.contains("latest published unavailable"));
+        assert!(check.detail.contains(SOROBAN_SDK_VERSION));
     }
 
     #[test]
@@ -1493,7 +1913,7 @@ mod tests {
     fn docker_absent_warns_without_failing() {
         let check = classify_docker(None, false);
         assert_eq!(check.status, Status::Warn);
-        assert_eq!(failure_count(&[check.clone()]), 0);
+        assert_eq!(failure_count(std::slice::from_ref(&check)), 0);
         assert!(check.detail.contains("not found"));
         assert!(check.fix.unwrap().contains("docs.docker.com"));
     }
@@ -1644,10 +2064,173 @@ mod tests {
     }
 
     #[test]
-    fn docker_and_git_identity_are_not_auto_fixable() {
-        for name in ["docker", "git identity"] {
+    fn docker_and_git_identity_and_disk_space_are_not_auto_fixable() {
+        for name in ["docker", "git identity", "disk space"] {
             assert!(remedy(&fail(name)).is_none(), "{name}");
         }
+    }
+
+    // ---- Cargo.lock (reproducible CI builds) ----
+
+    /// A cargo project inside its own git repository, so `git check-ignore`
+    /// answers from this project's rules rather than an enclosing repo's.
+    /// `None` when git is unavailable, leaving the caller nothing to probe.
+    fn git_project(manifest: &str) -> Option<tempfile::TempDir> {
+        let dir = project_with_manifest(manifest);
+        let initialized = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        initialized.then_some(dir)
+    }
+
+    #[test]
+    fn lockfile_present_and_not_ignored_passes() {
+        let check = classify_cargo_lock(true, LockIgnored::No);
+        assert_eq!(check.status, Status::Pass);
+    // ---- disk space check ----
+
+    #[test]
+    fn format_bytes_formats_correct_units() {
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(format_bytes(500 * 1024 * 1024), "500.0 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(format_bytes(50 * 1024 * 1024 * 1024), "50.0 GB");
+        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024 * 1024), "2.0 TB");
+    }
+
+    #[test]
+    fn disk_space_reports_pass_when_above_threshold() {
+        let check = classify_disk_space(Some(10 * 1024 * 1024 * 1024), MIN_FREE_DISK_SPACE_BYTES);
+        assert_eq!(check.status, Status::Pass);
+        assert_eq!(check.name, "disk space");
+        assert!(check.detail.contains("10.0 GB free"));
+        assert!(check.fix.is_none());
+    }
+
+    #[test]
+    fn lockfile_present_without_a_git_verdict_passes() {
+        // No git, or not a repository: there is a lockfile, and nothing
+        // suggests version control would drop it.
+        let check = classify_cargo_lock(true, LockIgnored::Unknown);
+        assert_eq!(check.status, Status::Pass);
+    fn disk_space_reports_pass_at_exact_threshold() {
+        let check = classify_disk_space(Some(MIN_FREE_DISK_SPACE_BYTES), MIN_FREE_DISK_SPACE_BYTES);
+        assert_eq!(check.status, Status::Pass);
+        assert_eq!(check.name, "disk space");
+        assert!(check.detail.contains("1.0 GB free"));
+        assert!(check.fix.is_none());
+    }
+
+    #[test]
+    fn gitignored_lockfile_warns() {
+        let check = classify_cargo_lock(true, LockIgnored::Yes);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("excluded by .gitignore"));
+        assert!(check.fix.unwrap().contains(".gitignore"));
+    }
+
+    #[test]
+    fn missing_lockfile_warns() {
+        let check = classify_cargo_lock(false, LockIgnored::No);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("not found"));
+        assert!(check.fix.unwrap().contains("cargo generate-lockfile"));
+    }
+
+    #[test]
+    fn missing_and_gitignored_lockfile_reports_both() {
+        let check = classify_cargo_lock(false, LockIgnored::Yes);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("not found"));
+        assert!(check.detail.contains(".gitignore"));
+        let fix = check.fix.unwrap();
+        assert!(fix.contains(".gitignore"));
+        assert!(fix.contains("cargo generate-lockfile"));
+    }
+
+    #[test]
+    fn lockfile_problems_never_fail_the_run() {
+        // Reproducibility is advisory: a project without a committed lockfile
+        // still builds, so doctor must not exit non-zero over it.
+        for ignored in [LockIgnored::Yes, LockIgnored::No, LockIgnored::Unknown] {
+            assert_eq!(failure_count(&[classify_cargo_lock(false, ignored)]), 0);
+            assert_eq!(failure_count(&[classify_cargo_lock(true, ignored)]), 0);
+        }
+    }
+
+    #[test]
+    fn lockfile_check_skipped_outside_a_cargo_project() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(cargo_lock_check(dir.path()).is_none());
+    }
+
+    #[test]
+    fn lockfile_check_warns_when_the_project_has_no_lockfile() {
+        // The acceptance case, through the real wrapper: a cargo project with
+        // no Cargo.lock warns whatever git says about the path.
+        let dir = project_with_manifest("[package]\nname = \"x\"\nversion = \"0.1.0\"\n");
+        let check = cargo_lock_check(dir.path()).unwrap();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("not found"));
+    }
+
+    #[test]
+    fn lockfile_check_reads_gitignore_from_the_project_repository() {
+        let Some(dir) = git_project("[package]\nname = \"x\"\nversion = \"0.1.0\"\n") else {
+            return; // git unavailable — nothing to probe
+        };
+        std::fs::write(dir.path().join("Cargo.lock"), "version = 4\n").unwrap();
+
+        // Present, with no rule excluding it: version control will carry it.
+        assert_eq!(cargo_lock_check(dir.path()).unwrap().status, Status::Pass);
+
+        // The same lockfile, now excluded — CI would never see it.
+        std::fs::write(dir.path().join(".gitignore"), "Cargo.lock\n").unwrap();
+        let check = cargo_lock_check(dir.path()).unwrap();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("excluded by .gitignore"));
+    }
+
+    #[test]
+    fn lockfile_is_not_auto_fixable() {
+        // `cargo generate-lockfile` is safe to run, but committing the result
+        // is the user's call — so this is reported, never auto-fixed.
+        assert!(remedy(&fail("Cargo.lock")).is_none());
+    fn disk_space_reports_warn_when_below_threshold() {
+        let check = classify_disk_space(Some(500 * 1024 * 1024), MIN_FREE_DISK_SPACE_BYTES);
+        assert_eq!(check.status, Status::Warn);
+        assert_eq!(check.name, "disk space");
+        assert!(check.detail.contains("500.0 MB free (low;"));
+        assert!(check.fix.unwrap().contains("free up disk space"));
+    }
+
+    #[test]
+    fn disk_space_reports_warn_at_zero() {
+        let check = classify_disk_space(Some(0), MIN_FREE_DISK_SPACE_BYTES);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("0 B free (low;"));
+    }
+
+    #[test]
+    fn disk_space_warns_when_available_is_none() {
+        let check = classify_disk_space(None, MIN_FREE_DISK_SPACE_BYTES);
+        assert_eq!(check.status, Status::Warn);
+        assert_eq!(check.name, "disk space");
+        assert!(check.detail.contains("could not determine"));
+        assert!(check.fix.is_some());
+    }
+
+    #[test]
+    fn disk_space_live_check_runs() {
+        let check = disk_space_check(Path::new("."));
+        assert_eq!(check.name, "disk space");
+        assert!(matches!(check.status, Status::Pass | Status::Warn));
     }
 
     // ---- auto-fix (`--fix`) ----

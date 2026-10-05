@@ -10,9 +10,8 @@
 - `--log-file <path>` — also write JSON-lines structured logs to a file while trying to
   preserving normal terminal output.
 - `--offline` — prohibit network access. Network-dependent operations fail with a
-  a clear message, while `doctor` skips its connectivity prob.
-
-  cd
+  clear message; `doctor` skips connectivity checks and uses the SDK version
+  pinned in forge templates instead of querying crates.io.
 
 Global options may appear before or after a subcommand and can be combined.
 
@@ -57,7 +56,7 @@ scaffolding.
 - `soroban-forge ci-init --provider github [--dependabot]` — generate CI
   workflows (build+test and a rustfmp/clippy lint job); `--dependabot` also
   writes `.github/dependabot.yml` for weekly cargo and github-actions updates.
-- `soroban-forge doctor [--json]` — check the local Soroban toolchain (optionally emitting machine-readable JSON).
+- `soroban-forge doctor [--json]` — check the local Soroban toolchain (optionally emitting machine-readable JSON). Inside a contract project, it reports the declared `soroban-sdk` version against the latest stable crates.io release and recommends an update when behind. If crates.io is unreachable, it falls back to the SDK version pinned in forge templates.
 - `soroban-forge bindings ts [--out-dir <dir>] [--package-name <name>] [--react]` — generate a TypeScript client package from the built contract wasm.
   - `--out-dir <dir>` (alias `--output`) — target directory for generated bindings. Defaults to `bindings/<contract_name>`.
   - `--package-name <name>` — npm package name for the generated `package.json`. Validated as a legal npm package name. Defaults to `@soroban-contracts/<name>`.

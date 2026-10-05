@@ -28,11 +28,7 @@ pub fn format_template_listing(catalog: &[TemplateInfo]) -> String {
         return "no templates available.\n".to_string();
     }
 
-    let name_width = catalog
-        .iter()
-        .map(|t| t.name.len())
-        .max()
-        .unwrap_or(0);
+    let name_width = catalog.iter().map(|t| t.name.len()).max().unwrap_or(0);
 
     let mut out = String::from("bundled templates:\n\n");
     for entry in catalog {
@@ -100,7 +96,10 @@ mod tests {
     fn listing_contains_every_template_name() {
         let catalog = make_catalog(&[
             ("crowdfund", "escrow/deadline crowdfunding contract"),
-            ("hello-world", "minimal greeter contract (recommended starting point)"),
+            (
+                "hello-world",
+                "minimal greeter contract (recommended starting point)",
+            ),
             ("nft", "NFT (non-fungible token) with per-token metadata"),
             ("staking", "proportional reward staking"),
             ("token", "SEP-41 fungible token"),
@@ -117,9 +116,15 @@ mod tests {
     fn listing_contains_every_description() {
         let catalog = make_catalog(&[
             ("crowdfund", "escrow/deadline crowdfunding contract"),
-            ("hello-world", "minimal greeter contract (recommended starting point)"),
+            (
+                "hello-world",
+                "minimal greeter contract (recommended starting point)",
+            ),
             ("nft", "NFT (non-fungible token) with per-token metadata"),
-            ("staking", "proportional reward staking with O(1) acc_reward_per_share accumulator"),
+            (
+                "staking",
+                "proportional reward staking with O(1) acc_reward_per_share accumulator",
+            ),
             ("token", "SEP-41 fungible token"),
         ]);
         let output = format_template_listing(&catalog);
@@ -133,13 +138,10 @@ mod tests {
     #[test]
     fn listing_aligns_descriptions() {
         // Names of different lengths — descriptions must all start at the same column.
-        let catalog = make_catalog(&[
-            ("ab", "short name"),
-            ("abcdefghij", "long name"),
-        ]);
+        let catalog = make_catalog(&[("ab", "short name"), ("abcdefghij", "long name")]);
         let output = format_template_listing(&catalog);
         let lines: Vec<&str> = output.lines().skip(2).collect(); // skip header + blank
-        // Both description columns should start at the same offset.
+                                                                 // Both description columns should start at the same offset.
         let col0 = lines[0].find("short name").expect("short name not found");
         let col1 = lines[1].find("long name").expect("long name not found");
         assert_eq!(col0, col1, "descriptions are not aligned:\n{output}");
