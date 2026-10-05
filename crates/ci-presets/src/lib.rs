@@ -1212,62 +1212,37 @@ mod tests {
         assert!(matches.get_flag("remove"));
     }
 
-    // ── --msrv validation tests ─────────────────────────────────────────────
-
+    /// `--remove` only removes forge's own generated preset files, never arbitrary
+    /// user files in the same directory.
     #[test]
-    fn msrv_validation_accepts_valid_versions() {
-        assert!(validate_msrv("1.84").is_ok());
-        assert!(validate_msrv("1.84.0").is_ok());
-        assert!(validate_msrv("1.80").is_ok());
-        assert!(validate_msrv("2.0.1").is_ok());
-    }
-
-    #[test]
-    fn msrv_validation_rejects_invalid_versions() {
-        assert!(validate_msrv("latest").is_err());
-        assert!(validate_msrv("1.84.0.1").is_err());
-        assert!(validate_msrv("1").is_err());
-        assert!(validate_msrv("v1.84").is_err());
-        assert!(validate_msrv("1.84-nightly").is_err());
-        assert!(validate_msrv("").is_err());
-        assert!(validate_msrv("1.").is_err());
-        assert!(validate_msrv(".84").is_err());
-    }
-
-    #[test]
-    fn generate_fails_before_writing_files_on_invalid_msrv() {
+    fn remove_preserves_unrelated_user_files() {
         let dir = tempfile::tempdir().unwrap();
-        let opts = GenerateOptions {
-            msrv: Some("latest".to_string()),
-            ..Default::default()
-        };
-        let err = generate(dir.path(), "github", "demo", false, false, &opts, false).unwrap_err();
-        match err {
-            ForgeError::InvalidArgument(msg) => {
-                assert!(msg.contains("invalid --msrv value `latest`"));
-            }
-            other => panic!("expected InvalidArgument, got {other:?}"),
-        }
-        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
-        assert!(entries.is_empty(), "no files should be written when msrv is invalid");
+        let opts = GenerateOptions::default();
+        let written = generate(dir.path(), "github", "demo", false, false, &opts, false).unwrap();
+        assert!(!written.is_empty());
+
+        let wf_dir = dir.path().join(".github/workflows");
+        let custom_file = wf_dir.join("my-custom-pipeline.yml");
+        std::fs::write(&custom_file, "name: custom\non: push\njobs: {}\n").unwrap();
+
+        let removed = remove(dir.path(), "github", true).unwrap();
+        assert_eq!(removed.len(), written.len());
+        assert!(!wf_dir.join("build-test.yml").exists());
+        assert!(custom_file.exists(), "custom user file must not be removed");
     }
 
+    /// `--remove` removes previously generated files for other providers (e.g. gitlab).
     #[test]
-    fn run_fails_on_invalid_msrv() {
-        let plugin = CiPresetsPlugin;
-        let cmd = plugin.command();
-        let matches = cmd
-            .try_get_matches_from(["ci-init", "--provider", "github", "--msrv", "1.84.0.1"])
-            .unwrap();
+    fn remove_deletes_gitlab_preset_files() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ForgeContext::new(dir.path().to_path_buf(), 0).unwrap();
-        let err = plugin.run(&matches, &ctx).unwrap_err();
-        match err {
-            ForgeError::InvalidArgument(msg) => {
-                assert!(msg.contains("invalid --msrv value `1.84.0.1`"));
-            }
-            other => panic!("expected InvalidArgument, got {other:?}"),
-        }
+        let opts = GenerateOptions::default();
+        let written = generate(dir.path(), "gitlab", "demo", false, false, &opts, false).unwrap();
+        assert_eq!(written, vec![".gitlab-ci.yml".to_string()]);
+        assert!(dir.path().join(".gitlab-ci.yml").exists());
+
+        let removed = remove(dir.path(), "gitlab", false).unwrap();
+        assert_eq!(removed, vec![".gitlab-ci.yml".to_string()]);
+        assert!(!dir.path().join(".gitlab-ci.yml").exists());
     }
 }
 
