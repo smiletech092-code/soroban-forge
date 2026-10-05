@@ -31,7 +31,7 @@ use soroban_forge_core::render::{render_str, Vars};
 use soroban_forge_core::{ForgeContext, ForgeError, ForgePlugin, Result};
 
 pub use detect::{inspect, ContractInfo};
-pub use bench::{build_bench, ensure_bench_target};
+pub use bench::{bench_cargo_snippet, build_bench, ensure_bench_target};
 pub use containers::build_roundtrip_tests;
 pub use target::{candidates, resolve, Candidate, Selection};
 pub use upgrade::build_upgrade_test;
@@ -694,12 +694,20 @@ pub fn write_bench_files(dir: &Path, info: &ContractInfo, force: bool) -> Result
     // Without the `[[bench]]` target and the criterion dev-dependency,
     // `cargo bench` never picks the file up.
     let manifest_path = dir.join("Cargo.toml");
-    let manifest = std::fs::read_to_string(&manifest_path)
-        .map_err(ForgeError::io(format!("reading {}", manifest_path.display())))?;
-    if let Some(updated) = ensure_bench_target(&manifest) {
-        std::fs::write(&manifest_path, updated)
-            .map_err(ForgeError::io(format!("writing {}", manifest_path.display())))?;
-        written.push("Cargo.toml");
+    if manifest_path.exists() {
+        let manifest = std::fs::read_to_string(&manifest_path)
+            .map_err(ForgeError::io(format!("reading {}", manifest_path.display())))?;
+        if let Some(updated) = ensure_bench_target(&manifest) {
+            std::fs::write(&manifest_path, updated)
+                .map_err(ForgeError::io(format!("writing {}", manifest_path.display())))?;
+            written.push("Cargo.toml");
+        }
+    } else {
+        eprintln!(
+            "note: Cargo.toml not found in {}. To run benchmarks with `cargo bench`, ensure your Cargo.toml has:\n{}\n",
+            dir.display(),
+            bench_cargo_snippet()
+        );
     }
 
     Ok(written)

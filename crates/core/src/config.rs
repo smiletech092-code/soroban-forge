@@ -7,6 +7,9 @@
 //!
 //! [scaffold]
 //! default_template = "hello-world"
+//!
+//! User defaults are read from `~/.config/soroban-forge/config.toml` and may
+//! set `[network]`, `[identity] default`, and `[scaffold]` values.
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -30,6 +33,27 @@ pub struct ForgeConfig {
     pub defaults: DefaultsConfig,
     #[serde(default)]
     pub network: NetworkConfig,
+    #[serde(default)]
+    pub bindings: BindingsConfig,
+    #[serde(default)]
+    pub identity: IdentityConfig,
+}
+
+/// `[bindings]` section — top-level bindings configuration.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+pub struct BindingsConfig {
+    /// Settings for the `bindings ts` subcommand.
+    #[serde(default, rename = "ts")]
+    pub ts: BindingsTsConfig,
+}
+
+/// `[bindings.ts]` section — TypeScript binding generation settings.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+pub struct BindingsTsConfig {
+    /// Default output directory for the generated TypeScript package,
+    /// relative to the contract project directory.
+    /// Overridden at the command line by `--out-dir` / `--output`.
+    pub output: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
@@ -46,12 +70,22 @@ pub struct ScaffoldConfig {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+pub struct IdentityConfig {
+    /// Default source identity for commands that sign transactions.
+    pub default: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 pub struct DefaultsConfig {
     pub timeout_secs: Option<u64>,
     /// Maximum size in bytes for `optimize --check`.
     pub max_size: Option<u64>,
     #[serde(default, rename = "ci-init", alias = "ci_init")]
     pub ci_init: CiInitDefaults,
+    /// Set to `false` to permanently opt out of the release-version check.
+    /// The check can also be suppressed per-invocation via `--offline` or the
+    /// `SOROBAN_FORGE_NO_UPDATE_CHECK=1` environment variable.
+    pub update_check: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
@@ -67,6 +101,55 @@ pub struct NetworkConfig {
 }
 
 impl ForgeConfig {
+    /// Path to the optional user-wide defaults file.
+    pub fn user_config_path() -> Option<PathBuf> {
+        let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .map(|home| PathBuf::from(home).join(".config"))
+            })?;
+        Some(config_dir.join("soroban-forge").join("config.toml"))
+    }
+
+    /// Merge user defaults beneath project configuration, field by field.
+    /// User config contributes network, identity, and template defaults only;
+    /// project metadata remains local to each project.
+    pub fn load_effective(project: Option<Self>, user: Option<Self>) -> Option<Self> {
+        if project.is_none() && user.is_none() {
+            return None;
+        }
+        let mut effective = project.clone().unwrap_or_default();
+        let user = user.unwrap_or_default();
+        let project = project.unwrap_or_default();
+        effective.scaffold.default_template = project
+            .scaffold
+            .default_template
+            .or(user.scaffold.default_template);
+        effective.network.name = project.network.name.or(user.network.name);
+        effective.network.rpc_url = project.network.rpc_url.or(user.network.rpc_url);
+        effective.network.passphrase = project
+            .network
+            .passphrase
+            .or(user.network.passphrase);
+        effective.identity.default = project.identity.default.or(user.identity.default);
+        Some(effective)
+    }
+
+    /// Read the optional user-level defaults file. Missing files are normal;
+    /// malformed or unreadable files return a configuration error.
+    pub fn load_user_config() -> Result<Option<Self>> {
+        let Some(path) = Self::user_config_path() else {
+            return Ok(None);
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        Self::load_from_path(&path).map(Some)
+    }
+
     /// Load `forge.toml` from `dir`, returning `Ok(None)` when the file does
     /// not exist and an error only when it exists but cannot be parsed.
     pub fn load_from(dir: &Path) -> Result<Option<Self>> {
@@ -207,10 +290,13 @@ max_size = 65536
             "[scaffold] default_template",
             "[defaults] timeout_secs",
             "[defaults] max_size",
+            "[defaults] update_check",
             "[defaults.ci-init] max_size",
             "[network] name",
             "[network] rpc_url",
             "[network] passphrase",
+            "[bindings.ts] output",
+            "[identity] default",
         ];
         for key in keys {
             let needle = format!("`{key}`");
@@ -238,17 +324,31 @@ pub fn unknown_keys(raw: &str) -> std::result::Result<Vec<String>, toml::de::Err
             "scaffold" => {
                 collect_strays(value, &["default_template"], "scaffold", &mut strays)
             }
-            "network" => collect_strays(value, &["name", "rpc_url", "passphrase"], "network", &mut strays),
+            "network" => collect_strays(
+                value,
+                &["name", "rpc_url", "passphrase"],
+                "network",
+                &mut strays,
+            ),
+            "identity" => collect_strays(value, &["default"], "identity", &mut strays),
             "defaults" => {
                 collect_strays(
                     value,
-                    &["timeout_secs", "max_size", "ci-init", "ci_init"],
+                    &["timeout_secs", "max_size", "ci-init", "ci_init", "update_check"],
                     "defaults",
                     &mut strays,
                 );
                 if let toml::Value::Table(table) = value {
                     if let Some(ci_init) = table.get("ci-init").or_else(|| table.get("ci_init")) {
                         collect_strays(ci_init, &["max_size"], "defaults.ci-init", &mut strays);
+                    }
+                }
+            }
+            "bindings" => {
+                collect_strays(value, &["ts"], "bindings", &mut strays);
+                if let toml::Value::Table(table) = value {
+                    if let Some(ts) = table.get("ts") {
+                        collect_strays(ts, &["output"], "bindings.ts", &mut strays);
                     }
                 }
             }
@@ -314,6 +414,10 @@ pub fn resolved_report(config: &Option<ForgeConfig>) -> String {
         Some(max_size) => out.push_str(&format!("max_size = {max_size}\n")),
         None => out.push_str("# max_size = (unset)\n"),
     }
+    match config.defaults.update_check {
+        Some(v) => out.push_str(&format!("update_check = {v}\n")),
+        None => out.push_str("update_check = true  # default\n"),
+    }
 
     out.push_str("\n[network]\n");
     match &config.network.name {
@@ -328,11 +432,23 @@ pub fn resolved_report(config: &Option<ForgeConfig>) -> String {
         Some(passphrase) => out.push_str(&format!("passphrase = \"{passphrase}\"\n")),
         None => out.push_str("# passphrase = (unset)\n"),
     }
+    out.push_str("\n[identity]\n");
+    match &config.identity.default {
+        Some(identity) => out.push_str(&format!("default = \"{identity}\"\n")),
+        None => out.push_str("# default = (unset)\n"),
+    }
     out.push_str("\n[defaults.ci-init]\n");
     match config.defaults.ci_init.max_size {
         Some(max_size) => out.push_str(&format!("max_size = {max_size}\n")),
         None => out.push_str("# max_size = (unset)\n"),
     }
+
+    out.push_str("\n[bindings.ts]\n");
+    match &config.bindings.ts.output {
+        Some(output) => out.push_str(&format!("output = \"{output}\"\n")),
+        None => out.push_str("# output = (unset, defaults to \"bindings/typescript\")\n"),
+    }
+
     out
 }
 
@@ -349,6 +465,9 @@ mod resolved_tests {
         assert!(report.contains("default_template = \"hello-world\""));
         assert!(report.contains("[defaults.ci-init]"));
         assert!(report.contains("# max_size = (unset)"));
+        assert!(report.contains("update_check = true"));
+        assert!(report.contains("[bindings.ts]"));
+        assert!(report.contains("# output = (unset"));
     }
 
     #[test]
@@ -389,9 +508,36 @@ mod resolved_tests {
     }
 
     #[test]
+    fn project_values_override_user_defaults_field_by_field() {
+        let user: ForgeConfig = toml::from_str(
+            "[network]\nname = \"mainnet\"\nrpc_url = \"https://user.example\"\n[identity]\ndefault = \"alice\"\n[scaffold]\ndefault_template = \"token\"\n[project]\nauthors = [\"Global Author\"]\n",
+        )
+        .unwrap();
+        let project: ForgeConfig = toml::from_str(
+            "[network]\nrpc_url = \"https://project.example\"\n[identity]\ndefault = \"bob\"\n",
+        )
+        .unwrap();
+
+        let effective = ForgeConfig::load_effective(Some(project), Some(user)).unwrap();
+        assert_eq!(effective.network.name.as_deref(), Some("mainnet"));
+        assert_eq!(
+            effective.network.rpc_url.as_deref(),
+            Some("https://project.example")
+        );
+        assert_eq!(effective.identity.default.as_deref(), Some("bob"));
+        assert_eq!(effective.scaffold.default_template.as_deref(), Some("token"));
+        assert!(effective.project.authors.is_empty());
+    }
+
+    #[test]
+    fn no_project_or_user_config_remains_absent() {
+        assert!(ForgeConfig::load_effective(None, None).is_none());
+    }
+
+    #[test]
     fn valid_keys_produce_no_warnings() {
         let strays = unknown_keys(
-            "[project]\nname = \"demo\"\nauthors = []\n[scaffold]\ndefault_template = \"token\"\n",
+            "[project]\nname = \"demo\"\nauthors = []\n[scaffold]\ndefault_template = \"token\"\n[identity]\ndefault = \"alice\"\n",
         )
         .unwrap();
         assert!(strays.is_empty());
@@ -400,5 +546,28 @@ mod resolved_tests {
     #[test]
     fn empty_file_produces_no_warnings() {
         assert!(unknown_keys("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parses_bindings_ts_output() {
+        let config: ForgeConfig =
+            toml::from_str("[bindings.ts]\noutput = \"packages/client\"\n").unwrap();
+        assert_eq!(
+            config.bindings.ts.output.as_deref(),
+            Some("packages/client")
+        );
+    }
+
+    #[test]
+    fn bindings_ts_output_unknown_key_is_flagged() {
+        let strays =
+            unknown_keys("[bindings.ts]\noutput = \"custom/dir\"\ntypo = \"oops\"\n").unwrap();
+        assert_eq!(strays, vec!["bindings.ts.typo"]);
+    }
+
+    #[test]
+    fn valid_bindings_ts_output_produces_no_warnings() {
+        let strays = unknown_keys("[bindings.ts]\noutput = \"custom/dir\"\n").unwrap();
+        assert!(strays.is_empty());
     }
 }

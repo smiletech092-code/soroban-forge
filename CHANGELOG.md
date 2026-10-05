@@ -7,6 +7,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+
+- `soroban-forge identity remove <name>` deletes a stored identity and reports
+  a clear error when the name is not found (#420)
 - `soroban-forge --list --json` now emits structured `builtin` and `external`
   subcommand arrays for scripts (#332)
 - `soroban-forge bindings-py`: a new crate generating a typed Python client
@@ -46,6 +49,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   published release, with each step marked manual or automated (#264)
 
 ### Fixed
+
 - `soroban-forge bindings ts` panicked ("Unknown argument or group id")
   on the plain, no-flags invocation — `--out-dir`'s fallback lookup queried
   its own `visible_alias` ("output") as if it were a second, separate arg id
@@ -105,6 +109,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   repaying and re-entering borrowers (#216)
 
 ### Changed
+
 - `test-init --bench` is no longer an alias for `--budget`. It now emits
   criterion benchmarks; use `--budget` for the CPU/memory ceiling test (#235)
 - `soroban-forge new --force` asks for confirmation before overwriting an
@@ -118,7 +123,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   outlives a ledger advance, as a starting point for rent regressions
 - `test-init --layout <tests|inline>` — choose between the `tests/`
   integration-test directory (default) and a single `#[cfg(test)] mod
-  forge_tests` inside `src/`
+forge_tests` inside `src/`
 - `ci-init --provider bitbucket` — generates `bitbucket-pipelines.yml`
   mirroring the GitHub build-test preset
 - `ci-init --matrix [--msrv <version>]` — a build/test workflow that runs the

@@ -10,7 +10,9 @@ Checks that are useful but not required warn instead of failing:
 |---|---|
 | `docker` | Docker is absent, or installed with its daemon down — reproducible WASM builds commonly use it |
 | `git identity` | `git config user.name` or `user.email` is unset — commits in a freshly created project fail confusingly without them |
-| `Cargo.lock` | `Cargo.toml` is newer than `Cargo.lock`, or the lockfile is missing and should be refreshed |
+| `Cargo.lock` | the lockfile is missing, or present but excluded by `.gitignore` (so CI never sees it) |
+| `disk space` | Free disk space is low (below 1 GiB) — WASM compilation and `target/` build directories can be large |
+| `soroban-sdk` | The project pins an older SDK than the latest stable release published on crates.io; if the registry is unavailable (or `--offline` is used), doctor compares against the template's pinned SDK version instead |
 
 ## Auto-fixing (`--fix`)
 

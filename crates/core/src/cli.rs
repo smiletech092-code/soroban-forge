@@ -19,6 +19,25 @@ use crate::error::{ForgeError, Result};
 use crate::plugin::{ForgeContext, ForgePlugin};
 use crate::timeout::parse_timeout_secs;
 
+/// The soroban-sdk version pinned into generated projects — kept in sync with
+/// `soroban_forge_scaffold::SOROBAN_SDK_VERSION` via a build-time constant.
+/// Duplicated here so core does not depend on scaffold.
+pub const SDK_VERSION: &str = "26.1.0";
+
+/// Build the extended version string shown by `--version`:
+///   `<pkg-version> (commit <hash>, soroban-sdk <sdk>)`
+fn version_string() -> &'static str {
+    // Use a `Box::leak` so we can return a `&'static str` without a global.
+    let git_hash = option_env!("SOROBAN_FORGE_GIT_HASH").unwrap_or("unknown");
+    let s = format!(
+        "{} (commit {}, soroban-sdk {})",
+        env!("CARGO_PKG_VERSION"),
+        git_hash,
+        SDK_VERSION,
+    );
+    Box::leak(s.into_boxed_str())
+}
+
 
 /// Levenshtein edit distance.
 pub fn edit_distance(a: &str, b: &str) -> usize {
@@ -58,8 +77,9 @@ pub fn env_flag(name: &str) -> bool {
 
 /// Build the top-level `soroban-forge` command from the registered plugins.
 pub fn build_command(plugins: &[Box<dyn ForgePlugin>]) -> Command {
+    let version_str = version_string();
     let mut cmd = Command::new("soroban-forge")
-        .version(env!("CARGO_PKG_VERSION"))
+        .version(version_str)
         .about(
             "Scaffolding, test-harness and CI toolkit for Soroban smart contracts on Stellar (CLI)",
         )
@@ -139,6 +159,15 @@ pub fn build_command(plugins: &[Box<dyn ForgePlugin>]) -> Command {
                 .help("Disable all network access"),
         )
         .arg(
+            Arg::new("color")
+                .long("color")
+                .global(true)
+                .value_name("WHEN")
+                .value_parser(["auto", "always", "never"])
+                .default_value("auto")
+                .help("Control color output: auto (default), always, or never"),
+        )
+        .arg(
             Arg::new("timeout")
                 .long("timeout")
                 .global(true)
@@ -164,6 +193,17 @@ pub fn build_command(plugins: &[Box<dyn ForgePlugin>]) -> Command {
                     .required(true)
                     .value_parser(["bash", "zsh", "fish", "powershell"])
                     .help("Shell to generate completions for"),
+            ),
+    );
+    cmd = cmd.subcommand(
+        Command::new("man")
+            .about("Generate man pages for soroban-forge and its subcommands")
+            .arg(
+                Arg::new("out-dir")
+                    .long("out-dir")
+                    .value_name("DIR")
+                    .default_value(".")
+                    .help("Directory to write man pages into (default: current directory)"),
             ),
     );
     cmd
@@ -248,8 +288,14 @@ pub fn run(plugins: Vec<Box<dyn ForgePlugin>>) -> Result<()> {
         return Ok(());
     }
 
-    let log_file = matches.get_one::<String>("log-file").map(std::path::Path::new);
-    crate::logging::init(matches.get_count("verbose"), log_file)?;
+    // Resolve color preference: --color flag wins; NO_COLOR env var disables
+    // color when the flag is left at its default ("auto").
+    let color_when = matches
+        .get_one::<String>("color")
+        .map(String::as_str)
+        .unwrap_or("auto");
+    let use_color = resolve_color(color_when);
+    crate::logging::init_with_color(matches.get_count("verbose"), matches.get_one::<String>("log-file").map(std::path::Path::new), use_color)?;
 
     let is_json = matches.get_flag("json");
     let result = dispatch(&plugins, &matches);
@@ -264,6 +310,27 @@ pub fn run(plugins: Vec<Box<dyn ForgePlugin>>) -> Result<()> {
         }
     }
     result
+}
+
+/// Determine whether color should be used given `--color WHEN` and the
+/// `NO_COLOR` environment variable.
+///
+/// - `"never"` → always disable
+/// - `"always"` → always enable (even if `NO_COLOR` is set)
+/// - `"auto"` (default) → disable when `NO_COLOR` is set to any non-empty
+///   value, otherwise leave it to `env_logger`'s own auto-detection
+pub fn resolve_color(when: &str) -> bool {
+    match when {
+        "never" => false,
+        "always" => true,
+        _ => {
+            // "auto": honour NO_COLOR (https://no-color.org/)
+            match std::env::var("NO_COLOR") {
+                Ok(v) if !v.is_empty() => false,
+                _ => true, // let env_logger do its own tty detection
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -482,7 +549,14 @@ mod tests {
     fn version_is_workspace_version() {
         let (plugins, _) = dummy();
         let cmd = build_command(&plugins);
-        assert_eq!(cmd.get_version(), Some(env!("CARGO_PKG_VERSION")));
+        // The version string starts with the package version and includes
+        // extra metadata (commit hash, sdk version).
+        let ver = cmd.get_version().unwrap_or("");
+        assert!(
+            ver.starts_with(env!("CARGO_PKG_VERSION")),
+            "version should start with pkg version, got: {ver}"
+        );
+        assert!(ver.contains("soroban-sdk"), "version should contain sdk version, got: {ver}");
     }
 
     #[test]

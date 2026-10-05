@@ -8,11 +8,10 @@ Usage:
     scripts/regenerate-examples.py --check     # diff against examples/, don't write
 
 `--check` is what CI runs: it scaffolds each example into a temp directory
-and diffs it against the checked-in tree, ignoring Cargo.lock (which is
-resolved against live crates.io state at generation time, independent of any
-template change) and target/ (build output, already gitignored). On a
-mismatch it prints the example, the diff, and the exact command that
-regenerates it.
+and diffs it against the checked-in tree, ignoring Cargo.lock (resolved
+against live crates.io state), README.md (examples may add curated guidance),
+and target/ (build output, already gitignored). On a mismatch it prints the
+example, the diff, and the exact command that regenerates it.
 
 hello-forge is intentionally excluded: it's the one example whose
 regeneration steps (`soroban-forge test-init`, `soroban-forge ci-init`) are
@@ -27,27 +26,20 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES_DIR = ROOT / "examples"
+TEMPLATES_DIR = ROOT / "templates"
 BINARY = ROOT / "target" / "release" / "soroban-forge"
 AUTHOR = "Joseph <josepholadele001@gmail.com>"
 
-# (directory name under examples/, template name). Keep in sync with the
-# table in examples/README.md.
+# Every bundled template has a same-named example. Discover both from the
+# template tree so adding a template automatically adds it to regeneration,
+# drift checking, and the CI build matrix.
 EXAMPLES = [
-    ("amm", "amm"),
-    ("crowdfund", "crowdfund"),
-    ("escrow", "escrow"),
-    ("merkle-airdrop", "merkle-airdrop"),
-    ("multisig", "multisig"),
-    ("nft", "nft"),
-    ("oracle-consumer", "oracle-consumer"),
-    ("staking", "staking"),
-    ("subscription", "subscription"),
-    ("timelock", "timelock"),
-    ("token", "token"),
-    ("vesting", "vesting"),
+    (path.name, path.name)
+    for path in sorted(TEMPLATES_DIR.iterdir())
+    if path.is_dir() and path.name != "_partials"
 ]
 
-IGNORED_NAMES = {"Cargo.lock", "target"}
+IGNORED_NAMES = {"Cargo.lock", "README.md", "target"}
 
 
 def regen_command(name: str, template: str, output: str) -> list[str]:
@@ -85,7 +77,7 @@ def scaffold(name: str, template: str, output_dir: Path) -> None:
     # (see examples/README.md): a resolved lockfile, checked in like
     # hello-forge's.
     subprocess.run(
-        ["cargo", "generate-lockfile"],
+        ["cargo", "+stable", "generate-lockfile"],
         check=True,
         capture_output=True,
         text=True,

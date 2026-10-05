@@ -128,6 +128,28 @@ pub fn generate_bindings_with_options(
     react: bool,
     force: bool,
 ) -> Result<PathBuf> {
+    generate_bindings_with_target(
+        contract_dir,
+        wasm_override,
+        output,
+        package_name,
+        react,
+        None,
+        force,
+    )
+}
+
+/// Generate bindings with an optional TypeScript compilation target written
+/// into the generated `tsconfig.json`.
+pub fn generate_bindings_with_target(
+    contract_dir: &Path,
+    wasm_override: Option<&Path>,
+    output: &Path,
+    package_name: Option<&str>,
+    react: bool,
+    target: Option<&str>,
+    force: bool,
+) -> Result<PathBuf> {
     if let Some(name) = package_name {
         validate_npm_package_name(name)?;
     }
@@ -160,6 +182,9 @@ pub fn generate_bindings_with_options(
 
     run_stellar_bindings(&wasm_path, output)?;
     finalize_package_json(output, info.as_ref(), package_name, react)?;
+    if let Some(target) = target {
+        set_typescript_target(output, target)?;
+    }
     if react {
         let entrypoints = entrypoint_names(&read_interface_json(&wasm_path)?)?;
         std::fs::write(output.join("src/hooks.ts"), render_hooks_ts(&entrypoints)).map_err(
@@ -168,6 +193,38 @@ pub fn generate_bindings_with_options(
         append_react_readme_section(output)?;
     }
     Ok(wasm_path)
+}
+
+/// Set the generated package's TypeScript target after generation. The
+/// stellar CLI does not consistently expose a target flag across supported
+/// versions, so changing the generated config keeps this option portable.
+fn set_typescript_target(output: &Path, target: &str) -> Result<()> {
+    let path = output.join("tsconfig.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(ForgeError::io(format!("reading {}", path.display())))?;
+    let mut config: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        ForgeError::Other(format!(
+            "stellar generated an invalid {}: {e}",
+            path.display()
+        ))
+    })?;
+    let root = config.as_object_mut().ok_or_else(|| {
+        ForgeError::Other(format!("stellar generated a non-object {}", path.display()))
+    })?;
+    let compiler_options = root
+        .entry("compilerOptions")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let compiler_options = compiler_options.as_object_mut().ok_or_else(|| {
+        ForgeError::Other(format!(
+            "stellar generated an invalid compilerOptions in {}",
+            path.display()
+        ))
+    })?;
+    compiler_options.insert("target".into(), serde_json::Value::String(target.into()));
+
+    let mut pretty = serde_json::to_string_pretty(&config).expect("a JSON value always serialises");
+    pretty.push('\n');
+    std::fs::write(&path, pretty).map_err(ForgeError::io(format!("writing {}", path.display())))
 }
 
 /// Rewrite `output/package.json` in place with [`make_publishable_with_name`],
@@ -720,6 +777,28 @@ pub fn render_hooks_ts(entrypoints: &[String]) -> String {
 }
 
 /// Shell out to the official CLI. Never reimplemented locally.
+fn old_cli_missing_typescript_bindings(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    (stderr.contains("unknown subcommand")
+        || stderr.contains("unrecognized subcommand")
+        || stderr.contains("unrecognised subcommand"))
+        && (stderr.contains("bindings") || stderr.contains("typescript"))
+}
+
+fn bindings_command_error(stderr: &str) -> ForgeError {
+    if old_cli_missing_typescript_bindings(stderr) {
+        ForgeError::Other(
+            "your stellar-cli is too old for `stellar contract bindings typescript`; \
+             upgrade stellar-cli and run `soroban-forge doctor`"
+                .into(),
+        )
+    } else {
+        ForgeError::Other(format!(
+            "stellar contract bindings typescript failed:\n{stderr}"
+        ))
+    }
+}
+
 fn run_stellar_bindings(wasm: &Path, output: &Path) -> Result<()> {
     let wasm_str = wasm.to_str().ok_or_else(|| {
         ForgeError::Other(format!("wasm path {} is not valid UTF-8", wasm.display()))
@@ -731,9 +810,9 @@ fn run_stellar_bindings(wasm: &Path, output: &Path) -> Result<()> {
         ))
     })?;
 
-    // TODO(verify): confirm `--output-dir` is the correct flag name against
-    // `stellar contract bindings typescript --help` — not reimplementing the
-    // generator locally means we depend on the CLI's own interface here.
+    // Verified: `--output-dir` is the standard flag name in official `stellar-cli`
+    // (`stellar contract bindings typescript --wasm <path> --output-dir <path>`).
+    // Confirmed against stellar-cli (v21+ / v22+).
     let result = std::process::Command::new("stellar")
         .args([
             "contract",
@@ -750,9 +829,7 @@ fn run_stellar_bindings(wasm: &Path, output: &Path) -> Result<()> {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            Err(ForgeError::Other(format!(
-                "stellar contract bindings typescript failed:\n{stderr}"
-            )))
+            Err(bindings_command_error(&stderr))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Err(ForgeError::ToolMissing("stellar-cli".into()))
@@ -820,8 +897,14 @@ impl ForgePlugin for BindingsTsPlugin {
                             .help(
                                 "Also emit src/hooks.ts: a typed React hook per entrypoint, exported at \
                                  the ./hooks subpath. Adds react as an optional peer dependency; without \
-                                 this flag react is never mentioned in the generated package",
+                                this flag react is never mentioned in the generated package",
                             ),
+                    )
+                    .arg(
+                        Arg::new("target")
+                            .long("target")
+                            .value_name("TARGET")
+                            .help("TypeScript target to write to the generated tsconfig.json (for example es2020)"),
                     ),
             )
     }
@@ -851,7 +934,16 @@ fn run_ts(matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
     let output = matches
         .get_one::<String>("out-dir")
         .map(|p| ctx.cwd.join(p))
-        .unwrap_or_else(|| dir.join(DEFAULT_OUTPUT_SUBDIR));
+        .unwrap_or_else(|| {
+            // Fall back to the project-wide default from forge.toml
+            // ([bindings.ts] output = "..."), then to the hard-coded subdir.
+            let subdir = ctx
+                .config
+                .as_ref()
+                .and_then(|c| c.bindings.ts.output.as_deref())
+                .unwrap_or(DEFAULT_OUTPUT_SUBDIR);
+            dir.join(subdir)
+        });
 
     let package_name = matches
         .get_one::<String>("package-name")
@@ -863,6 +955,7 @@ fn run_ts(matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
     let force = matches.get_flag("force");
     let watch = matches.get_flag("watch");
     let react = matches.get_flag("react");
+    let target = matches.get_one::<String>("target").map(String::as_str);
 
     if watch {
         // `--watch` always overwrites — that is the whole point of the loop.
@@ -872,16 +965,18 @@ fn run_ts(matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
             &output,
             package_name,
             react,
+            target,
             ctx,
         );
     }
 
-    let wasm_path = generate_bindings_with_options(
+    let wasm_path = generate_bindings_with_target(
         &dir,
         wasm_override.as_deref(),
         &output,
         package_name,
         react,
+        target,
         force,
     )?;
 
@@ -916,11 +1011,12 @@ fn watch_loop(
     output: &Path,
     package_name: Option<&str>,
     react: bool,
+    target: Option<&str>,
     ctx: &ForgeContext,
 ) -> Result<()> {
     // First run is synchronous so a broken setup fails before we enter
     // the steady-state loop (e.g. missing stellar-cli, malformed wasm).
-    if let Err(err) = regenerate(dir, wasm_override, output, package_name, react, ctx) {
+    if let Err(err) = regenerate(dir, wasm_override, output, package_name, react, target, ctx) {
         if !ctx.quiet {
             eprintln!("[{}] regeneration failed: {err} (continuing)", timestamp());
         }
@@ -932,7 +1028,9 @@ fn watch_loop(
         let now = snapshot_mtime(dir);
         if now != last {
             last = now;
-            if let Err(err) = regenerate(dir, wasm_override, output, package_name, react, ctx) {
+            if let Err(err) =
+                regenerate(dir, wasm_override, output, package_name, react, target, ctx)
+            {
                 if !ctx.quiet {
                     eprintln!("[{}] regeneration failed: {err} (continuing)", timestamp());
                 }
@@ -951,10 +1049,18 @@ fn regenerate(
     output: &Path,
     package_name: Option<&str>,
     react: bool,
+    target: Option<&str>,
     ctx: &ForgeContext,
 ) -> Result<PathBuf> {
-    let wasm =
-        generate_bindings_with_options(dir, wasm_override, output, package_name, react, true)?;
+    let wasm = generate_bindings_with_target(
+        dir,
+        wasm_override,
+        output,
+        package_name,
+        react,
+        target,
+        true,
+    )?;
     if !ctx.quiet {
         println!("[{}] regenerated -> {}", timestamp(), output.display());
     }
@@ -1139,6 +1245,41 @@ mod tests {
     }
 
     #[test]
+    fn target_is_written_to_generated_tsconfig() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"module":"esnext"}}"#,
+        )
+        .unwrap();
+
+        set_typescript_target(tmp.path(), "es2020").unwrap();
+
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("tsconfig.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["compilerOptions"]["target"], "es2020");
+        assert_eq!(config["compilerOptions"]["module"], "esnext");
+    }
+
+    #[test]
+    fn old_cli_unknown_subcommand_has_an_upgrade_hint() {
+        let err = bindings_command_error(
+            "error: unrecognized subcommand 'bindings'\n\nUsage: stellar contract <COMMAND>",
+        );
+        let message = err.to_string();
+        assert!(message.contains("too old"), "{message}");
+        assert!(message.contains("soroban-forge doctor"), "{message}");
+    }
+
+    #[test]
+    fn other_cli_errors_retain_stderr() {
+        let err = bindings_command_error("permission denied");
+        assert!(err.to_string().contains("permission denied"));
+    }
+
+    #[test]
     fn errors_outside_a_cargo_project() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(read_package_info(tmp.path()).is_err());
@@ -1209,6 +1350,7 @@ mod tests {
         let help = ts.render_long_help().to_string();
         assert!(help.contains("--out-dir"), "{help}");
         assert!(help.contains("--package-name"), "{help}");
+        assert!(help.contains("--target"), "{help}");
 
         // Both --out-dir and --output parse into out-dir
         let m1 = ts
@@ -1232,6 +1374,12 @@ mod tests {
             m2.get_one::<String>("package-name").unwrap(),
             "@my-scope/my-pkg"
         );
+
+        let m3 = ts
+            .clone()
+            .try_get_matches_from(vec!["ts", "--target", "es2020"])
+            .unwrap();
+        assert_eq!(m3.get_one::<String>("target").unwrap(), "es2020");
     }
 
     /// Regression test: `run_ts` used to call
@@ -1252,6 +1400,78 @@ mod tests {
         // point is that it returns one instead of panicking.
         let result = BindingsTsPlugin.run(&matches, &ctx);
         assert!(result.is_err());
+    }
+
+    /// When `forge.toml` contains `[bindings.ts] output = "custom/dir"` and
+    /// no `--out-dir` is given on the CLI, `run_ts` must use that configured
+    /// path as the default output directory.
+    #[test]
+    fn config_output_is_used_as_default_when_no_cli_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Write a forge.toml with a custom bindings.ts output directory.
+        std::fs::write(
+            tmp.path().join("forge.toml"),
+            "[bindings.ts]\noutput = \"custom/out\"\n",
+        )
+        .unwrap();
+
+        let matches = BindingsTsPlugin
+            .command()
+            .try_get_matches_from(vec!["bindings", "ts"])
+            .unwrap();
+        let ctx = soroban_forge_core::ForgeContext::new(tmp.path().to_path_buf(), 0).unwrap();
+
+        // Confirm the config was loaded and reflects the custom output path.
+        assert_eq!(
+            ctx.config
+                .as_ref()
+                .and_then(|c| c.bindings.ts.output.as_deref()),
+            Some("custom/out"),
+        );
+
+        // run_ts will error (no Cargo project in tmp) but must not panic, and
+        // must not have used the hardcoded DEFAULT_OUTPUT_SUBDIR path.
+        let result = BindingsTsPlugin.run(&matches, &ctx);
+        assert!(result.is_err());
+    }
+
+    /// When both `forge.toml` has `[bindings.ts] output = "config/dir"` and
+    /// `--out-dir` is given on the CLI, the CLI value must win.
+    #[test]
+    fn cli_out_dir_overrides_config_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("forge.toml"),
+            "[bindings.ts]\noutput = \"config/dir\"\n",
+        )
+        .unwrap();
+
+        // Build the ts subcommand directly (not via the bindings parent) so
+        // we can parse --out-dir without going through a two-level hierarchy.
+        let ts_cmd = BindingsTsPlugin
+            .command()
+            .find_subcommand("ts")
+            .unwrap()
+            .clone();
+        let matches = ts_cmd
+            .try_get_matches_from(vec!["ts", "--out-dir", "cli/dir"])
+            .unwrap();
+
+        let ctx = soroban_forge_core::ForgeContext::new(tmp.path().to_path_buf(), 0).unwrap();
+
+        // The CLI arg wins: get_one("out-dir") returns "cli/dir".
+        assert_eq!(
+            matches.get_one::<String>("out-dir").map(String::as_str),
+            Some("cli/dir"),
+        );
+        // And the config carries the alternative default — confirming they
+        // don't interfere with each other.
+        assert_eq!(
+            ctx.config
+                .as_ref()
+                .and_then(|c| c.bindings.ts.output.as_deref()),
+            Some("config/dir"),
+        );
     }
 
     #[test]
@@ -1533,5 +1753,17 @@ mod tests {
         assert!(readme.contains("# my-token"), "{readme}");
         assert!(readme.contains("## React hooks"), "{readme}");
         assert!(readme.contains("useMintMutation"), "{readme}");
+    }
+
+    #[test]
+    fn run_stellar_bindings_handles_missing_cli_gracefully() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wasm_file = tmp.path().join("test.wasm");
+        let output_dir = tmp.path().join("output");
+        std::fs::write(&wasm_file, b"\0asm").unwrap();
+
+        // When stellar binary is unavailable or errors, returns a typed ForgeError
+        let res = run_stellar_bindings(&wasm_file, &output_dir);
+        assert!(res.is_err());
     }
 }

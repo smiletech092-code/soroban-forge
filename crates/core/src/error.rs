@@ -168,6 +168,12 @@ mod tests {
     }
 
     #[test]
+    fn missing_tool_error_points_to_doctor() {
+        let error = ForgeError::ToolMissing("stellar-cli".into());
+        assert!(error.to_string().contains("soroban-forge doctor"));
+    }
+
+    #[test]
     fn unclassified_errors_map_to_exit_code_3() {
         assert_eq!(
             ForgeError::Other("oops".into()).exit_code(),

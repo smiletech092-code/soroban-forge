@@ -34,3 +34,26 @@ the pipeline under a `.buildkite/` directory at the project root.
 
 Templates may use `{{project_name}}` / `{{crate_name}}` / `{{msrv}}`; GitHub's
 own `${{ ... }}` expressions pass through rendering untouched.
+
+### GitHub step overrides
+
+To customize one generated GitHub Actions step without forking its entire
+workflow, add a YAML file under
+`.soroban-forge/ci-overrides/github/<workflow>/<job>/<step>.yml`. The file
+contains one complete YAML list item (starting with `-`); `ci-init` substitutes
+it for that preset step on normal generation, `--force` regeneration, and
+`--diff` previews. Overrides remain in the project and are reapplied whenever
+the workflow is regenerated.
+
+For example, to give the Rust dependency cache in `build-test.yml` a custom
+cache key, create
+`.soroban-forge/ci-overrides/github/build-test/build-and-test/rust-cache.yml`:
+
+```yaml
+- uses: Swatinem/rust-cache@v2
+  with:
+    key: rust-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+```
+
+The workflow, job, and step IDs correspond to the `ci-init-step` markers in
+the source preset files under `presets/github/`.

@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 soroban-forge-core.workspace = true
+soroban-forge-deploy.workspace = true
 clap.workspace = true
 toml.workspace = true
 serde.workspace = true
@@ -16,6 +17,7 @@ serde_json.workspace = true
 log.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+stellar-strkey = "0.0.13"
 
 [dev-dependencies]
 tempfile.workspace = true

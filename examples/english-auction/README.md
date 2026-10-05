@@ -1,0 +1,7 @@
+# english-auction
+
+English-auction contract template scaffold for iterative bids, minimum increments, and seller settlement flow.
+
+## Security
+
+This template is a starting point, not audited code. See [security-considerations.md](https://github.com/soroban-forge-labs/soroban-forge/blob/main/docs/security-considerations.md) for what it does and does not protect against.

@@ -1,4 +1,4 @@
-﻿//! Initialize soroban-forge in an existing contract project.
+//! Initialize soroban-forge in an existing contract project.
 
 use std::path::Path;
 
@@ -206,4 +206,3 @@ mod tests {
         );
     }
 }
-

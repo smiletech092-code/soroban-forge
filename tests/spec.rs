@@ -151,3 +151,164 @@ fn spec_with_contract_id_refuses_offline() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("offline mode"), "{stderr}");
 }
+
+// ---------------------------------------------------------------------------
+// #399 — --no-cache flag is accepted by the CLI
+// ---------------------------------------------------------------------------
+
+#[test]
+fn spec_help_mentions_no_cache() {
+    let output = forge().args(["spec", "--help"]).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("--no-cache"), "{stdout}");
+}
+
+#[test]
+fn spec_no_cache_flag_is_accepted() {
+    // Without a real wasm the command will fail at the "no built wasm" stage,
+    // but the flag itself must be recognised (no "unexpected argument" error).
+    let temp = tempfile::tempdir().unwrap();
+    let project = scaffold(temp.path(), "no-cache-demo");
+
+    let output = forge()
+        .args([
+            "spec",
+            "--path",
+            project.to_str().unwrap(),
+            "--no-cache",
+        ])
+        .output()
+        .unwrap();
+
+    // Fails because there is no built wasm — but NOT because --no-cache is unknown.
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--no-cache should be a recognised flag, got: {stderr}"
+    );
+    assert!(stderr.contains("stellar contract build"), "{stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// #401 — --count flag is accepted by the CLI
+// ---------------------------------------------------------------------------
+
+#[test]
+fn spec_help_mentions_count() {
+    let output = forge().args(["spec", "--help"]).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("--count"), "{stdout}");
+}
+
+#[test]
+fn spec_count_flag_is_accepted() {
+    // Same as no-cache: fails because of no wasm, but --count must be recognised.
+    let temp = tempfile::tempdir().unwrap();
+    let project = scaffold(temp.path(), "count-demo");
+
+    let output = forge()
+        .args([
+            "spec",
+            "--path",
+            project.to_str().unwrap(),
+            "--count",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--count should be a recognised flag, got: {stderr}"
+    );
+    assert!(stderr.contains("stellar contract build"), "{stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// #402 — --timeout is surfaced in spec help / accepted as a global flag
+// ---------------------------------------------------------------------------
+
+#[test]
+fn spec_global_timeout_flag_is_in_help() {
+    // The global --timeout flag is defined at the root command level.
+    let output = forge().arg("--help").output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("--timeout"), "{stdout}");
+}
+
+#[test]
+fn spec_with_timeout_flag_accepted() {
+    // Passes --timeout 30 before spec; command should fail at missing-wasm,
+    // not at "unrecognised argument".
+    let temp = tempfile::tempdir().unwrap();
+    let project = scaffold(temp.path(), "timeout-spec-demo");
+
+    let output = forge()
+        .args([
+            "--timeout",
+            "30",
+            "spec",
+            "--path",
+            project.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--timeout should be a recognised global flag, got: {stderr}"
+    );
+    assert!(stderr.contains("stellar contract build"), "{stderr}");
+}
+
+// #403 — spec --out: help must mention --out and --force
+#[test]
+fn spec_help_mentions_out_and_force_flags() {
+    let output = forge().args(["spec", "--help"]).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("--out"), "help must mention --out: {stdout}");
+    assert!(stdout.contains("--force"), "help must mention --force: {stdout}");
+}
+
+// #403 — spec --out: without --force, must refuse to overwrite an existing file
+#[test]
+fn spec_out_refuses_to_overwrite_existing_file_without_force() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = scaffold(temp.path(), "spec-out-no-force");
+    let out_file = temp.path().join("spec.txt");
+
+    // Pre-create the output file
+    std::fs::write(&out_file, "existing content").unwrap();
+
+    let output = forge()
+        .args([
+            "spec",
+            "--path",
+            project.to_str().unwrap(),
+            "--out",
+            out_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    // Should report AlreadyExists (exit code 1)
+    assert!(
+        stderr.contains("already exists") || output.status.code() == Some(1),
+        "expected already-exists error: {stderr}"
+    );
+    // Original file must be untouched
+    assert_eq!(
+        std::fs::read_to_string(&out_file).unwrap(),
+        "existing content"
+    );
+}

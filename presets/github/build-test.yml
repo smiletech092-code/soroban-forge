@@ -18,12 +18,16 @@ jobs:
     name: "{{project_name}}: build & test"
     runs-on: ubuntu-latest
     steps:
+      # ci-init-step: build-test/build-and-test/checkout
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      # ci-init-step: build-test/build-and-test/install-rust
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
           targets: wasm32v1-none
+      # ci-init-step: build-test/build-and-test/rust-cache
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      # ci-init-step: build-test/build-and-test/cache-wasm-target
       - name: Cache target/wasm32v1-none
         uses: actions/cache@v4
         with:
@@ -32,8 +36,10 @@ jobs:
           key: wasm-target-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             wasm-target-${{ runner.os }}-
+      # ci-init-step: build-test/build-and-test/run-tests
       - name: Run tests
         run: cargo test
+      # ci-init-step: build-test/build-and-test/build-contract
       - name: Build contract (wasm)
         run: cargo build --target wasm32v1-none --release
 
@@ -41,15 +47,20 @@ jobs:
     name: "{{project_name}}: lint (rustfmt + clippy)"
     runs-on: ubuntu-latest
     steps:
+      # ci-init-step: build-test/lint/checkout
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      # ci-init-step: build-test/lint/install-rust
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
           components: rustfmt, clippy
+      # ci-init-step: build-test/lint/rust-cache
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
       # Both steps are hard failures: rustfmt --check exits non-zero on any
       # diff, and -D warnings promotes every clippy lint to an error.
+      # ci-init-step: build-test/lint/check-formatting
       - name: Check formatting
         run: cargo fmt --all --check
+      # ci-init-step: build-test/lint/clippy
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings

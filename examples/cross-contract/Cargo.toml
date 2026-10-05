@@ -1,0 +1,13 @@
+[workspace]
+members = ["receiver", "caller"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Joseph <josepholadele001@gmail.com>"]
+publish = false
+
+[workspace.dependencies]
+soroban-sdk = "26.1.0"
+ed25519-dalek = { version = ">=2.0, <3" }

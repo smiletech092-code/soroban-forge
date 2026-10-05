@@ -21,12 +21,16 @@ jobs:
     name: "{{project_name}}: build wasm & publish release"
     runs-on: ubuntu-latest
     steps:
+      # ci-init-step: release/build-and-release/checkout
       - uses: actions/checkout@v4
+      # ci-init-step: release/build-and-release/install-rust
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32v1-none
+      # ci-init-step: release/build-and-release/rust-cache
       - uses: Swatinem/rust-cache@v2
+      # ci-init-step: release/build-and-release/cache-wasm-target
       - name: Cache target/wasm32v1-none
         uses: actions/cache@v4
         with:
@@ -35,12 +39,15 @@ jobs:
           key: wasm-target-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             wasm-target-${{ runner.os }}-
+      # ci-init-step: release/build-and-release/build-contract
       - name: Build contract (wasm)
         run: cargo build --target wasm32v1-none --release --locked
+      # ci-init-step: release/build-and-release/checksum
       - name: Checksum
         run: |
           cd target/wasm32v1-none/release
           sha256sum {{crate_name}}.wasm > {{crate_name}}.wasm.sha256
+      # ci-init-step: release/build-and-release/sign-release-artifacts
       - name: Sign release artifacts
         run: |
           openssl genrsa -out /tmp/release-signing.key 4096
@@ -48,6 +55,7 @@ jobs:
           cd target/wasm32v1-none/release
           openssl dgst -sha256 -sign /tmp/release-signing.key -out {{crate_name}}.wasm.sig {{crate_name}}.wasm
           openssl dgst -sha256 -sign /tmp/release-signing.key -out {{crate_name}}.wasm.sha256.sig {{crate_name}}.wasm.sha256
+      # ci-init-step: release/build-and-release/verify-reproducible-build
       - name: Verify reproducible build
         # Clean and rebuild from the same commit; the wasm hash must match.
         # Catches non-determinism (timestamps, absolute paths, etc.) before
@@ -60,6 +68,7 @@ jobs:
             echo "::error::build is not reproducible: wasm differs between two builds of the same commit"
             exit 1
           fi
+      # ci-init-step: release/build-and-release/verify-pinned-build
       - name: Verify reproducible build in pinned container
         env:
           RUST_IMAGE: "rust:1.84.0@sha256:12b68bb84516779d910706fb80f1705777459c1e5f6c7c0118c2fb4256d9ec3d"
@@ -78,6 +87,7 @@ jobs:
             echo "::error::Docker rebuild hash differs from the host build"
             exit 1
           fi
+      # ci-init-step: release/build-and-release/create-release
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:

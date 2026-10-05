@@ -16,6 +16,7 @@ serde_json.workspace = true
 log.workspace = true
 dirs = "6"
 ureq = "2"
+stellar-strkey = "0.0.13"
 
 [dev-dependencies]
 tempfile.workspace = true

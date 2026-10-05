@@ -41,14 +41,18 @@ jobs:
     name: "{{project_name}}: verify deployed contract"
     runs-on: ubuntu-latest
     steps:
+      # ci-init-step: testnet-healthcheck/healthcheck/checkout
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
+      # ci-init-step: testnet-healthcheck/healthcheck/install-rust
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
           targets: wasm32v1-none
 
+      # ci-init-step: testnet-healthcheck/healthcheck/rust-cache
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      # ci-init-step: testnet-healthcheck/healthcheck/cache-wasm-target
       - name: Cache target/wasm32v1-none
         uses: actions/cache@v4
         with:
@@ -58,12 +62,15 @@ jobs:
           restore-keys: |
             wasm-target-${{ runner.os }}-
 
+      # ci-init-step: testnet-healthcheck/healthcheck/build-contract
       - name: Build contract (wasm)
         run: cargo build --target wasm32v1-none --release --locked
 
+      # ci-init-step: testnet-healthcheck/healthcheck/install-forge
       - name: Install soroban-forge CLI
         run: cargo install --locked --git https://github.com/soroban-forge-labs/soroban-forge --branch main
 
+      # ci-init-step: testnet-healthcheck/healthcheck/verify-contract
       - name: Verify deployed contract matches local build
         run: |
           if [ -z "${CONTRACT_ID}" ]; then
@@ -76,6 +83,7 @@ jobs:
             soroban-forge verify "${CONTRACT_ID}" --network "${NETWORK}"
           fi
 
+      # ci-init-step: testnet-healthcheck/healthcheck/notify-on-failure
       - name: Notify on failure
         if: failure()
         run: |

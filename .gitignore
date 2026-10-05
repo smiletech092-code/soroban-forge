@@ -1,5 +1,82 @@
+# Build output
 target/
+
+# Wasm build artifacts
 *.wasm
+
+# macOS
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V4
+.Trashes
+
+# Demo and book output
 /demo
 /book
+/book/
+
+# Test snapshots and golden files generated during testing
+**/*.snap
+**/*.snap.new
+tests/snapshots/
+**/tests/snapshots/
+**/snapshots/
+
+# Soroban-forge spec cache (written to $TMPDIR at runtime, not the repo)
+# If ever a local cache dir is added inside the repo, exclude it:
+.spec-cache/
+
+# Generated example projects that are kept in the repo are tracked
+# intentionally; exclude any scratch example outputs created locally:
+/examples-scratch/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# Editor and IDE directories
+.idea/
+.vscode/
+*.iml
+
+# Logs
+*.log
+forge-debug.log
+
+# Environment files / secrets
+.env
+.env.*
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Node.js (generated TypeScript bindings output)
+node_modules/
+dist/
+.next/
+*.js.map
+
+# Python bytecode (generated Python bindings)
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Coverage / profiling artefacts
+lcov.info
+coverage/
+tarpaulin-report.html
+cobertura.xml
+*.profraw
+*.profdata
+
+# Criterion benchmark results
+criterion/
+
+# Local config overrides
+forge.local.toml

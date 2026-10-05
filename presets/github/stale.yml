@@ -25,6 +25,7 @@ jobs:
   stale:
     runs-on: ubuntu-latest
     steps:
+      # ci-init-step: stale/stale/stale-action
       - uses: actions/stale@v9
         with:
           days-before-stale: ${{ inputs.days-before-stale || 30 }}

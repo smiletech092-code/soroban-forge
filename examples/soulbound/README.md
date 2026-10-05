@@ -1,0 +1,25 @@
+# soulbound
+
+A soulbound (non-transferable) token contract for Stellar/Soroban, generated with [soroban-forge](https://github.com/soroban-forge-labs/soroban-forge).
+
+Tokens are minted directly to an owner address by an admin and can never be transferred — only minted or burned.
+
+## Commands
+
+```sh
+# Run unit tests
+cargo test
+
+# Build the release WASM file
+stellar contract build
+
+# Deploy to Testnet
+stellar contract deploy \
+  --wasm target/wasm32v1-none/release/soulbound.wasm \
+  --source <your-identity> \
+  --network testnet
+```
+
+## Security
+
+This template is a starting point, not audited code. See [security-considerations.md](https://github.com/soroban-forge-labs/soroban-forge/blob/main/docs/security-considerations.md) for what it does and does not protect against.

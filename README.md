@@ -18,9 +18,19 @@
 
 [![asciinema cast](https://asciinema.org/a/soroban-forge-zero-to-testnet.svg)](https://asciinema.org/a/soroban-forge-zero-to-testnet)
 
-You need Rust ≥ 1.84 ([rustup](https://rustup.rs)) and `git`. The two remaining
-pieces — the `wasm32v1-none` target and `stellar-cli` — are what `doctor --fix`
-installs in step 2.
+### Install soroban-forge
+
+**Homebrew** (macOS / Linux — no Rust required):
+
+```sh
+brew tap soroban-forge-labs/tap
+brew install soroban-forge
+```
+
+> Full Homebrew docs, including upgrade, uninstall, and shell completions:
+> [docs/install-homebrew.md](docs/install-homebrew.md)
+
+**From source** (requires Rust ≥ 1.84):
 
 ```sh
 # 1. install soroban-forge (from source, v0.1)

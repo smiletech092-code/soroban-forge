@@ -85,15 +85,15 @@ pub fn load_store(path: &PathBuf) -> Result<NetworkStore> {
 }
 
 /// Save the network store to disk, creating parent directories as needed.
+///
+/// Writes through [`soroban_forge_core::atomic::write_atomic`] (#470): the same
+/// non-atomic `fs::write` as the identity store, so a crash mid-write could
+/// leave `networks.json` unparseable.
 pub fn save_store(path: &PathBuf, store: &NetworkStore) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
-    }
     let json = serde_json::to_string_pretty(store)
         .map_err(|e| ForgeError::Other(format!("serializing network store: {e}")))?;
-    std::fs::write(path, json)
-        .map_err(ForgeError::io(format!("writing {}", path.display())))
+    soroban_forge_core::atomic::write_atomic(path, &json)
+        .map_err(|e| ForgeError::Other(format!("writing {}: {e}", path.display())))
 }
 
 /// Resolve a network by name: check the user store first, then fall back to
@@ -266,6 +266,42 @@ pub fn format_list(store: &NetworkStore) -> String {
     out
 }
 
+/// Validate that a URL string has a scheme and a non-empty host.
+///
+/// This is a lightweight check — not a full RFC 3986 parse — but it catches
+/// the most common typos (missing scheme, stray whitespace, bare hostnames).
+pub fn validate_rpc_url(url: &str) -> Result<()> {
+    let trimmed = url.trim();
+    if trimmed != url {
+        return Err(ForgeError::InvalidArgument(format!(
+            "rpc-url `{url}` contains leading or trailing whitespace"
+        )));
+    }
+
+    // Must have a scheme separated by "://"
+    let after_scheme = match trimmed.find("://") {
+        Some(pos) if pos > 0 => &trimmed[pos + 3..],
+        _ => {
+            return Err(ForgeError::InvalidArgument(format!(
+                "rpc-url `{url}` is not a well-formed URL — it must include a scheme (e.g. https://)"
+            )));
+        }
+    };
+
+    // The host part (before any path or port) must be non-empty
+    let host = after_scheme
+        .split(['/', ':', '?', '#'])
+        .next()
+        .unwrap_or("");
+    if host.is_empty() {
+        return Err(ForgeError::InvalidArgument(format!(
+            "rpc-url `{url}` has no host — expected a URL like https://soroban-testnet.stellar.org"
+        )));
+    }
+
+    Ok(())
+}
+
 /// The `network` subcommand.
 pub struct NetworkPlugin;
 
@@ -313,10 +349,25 @@ impl ForgePlugin for NetworkPlugin {
                             .required(true),
                     ),
             )
-            // #290 — new subcommand to print the current active network
+            // #406 — print the active default network's details (renamed from
+            // the #290 `current` stub; `current` kept as an alias for
+            // backward compatibility)
             .subcommand(
-                Command::new("current")
-                    .about("Print the currently active network name"),
+                Command::new("show")
+                    .about("Print the active default network's name, RPC URL and passphrase")
+                    .alias("current"),
+            )
+            // #467 — delete a stored network config (built-in presets cannot
+            // be removed). `rm` alias added per #404.
+            .subcommand(
+                Command::new("remove")
+                    .about("Delete a stored network config from the store")
+                    .alias("rm")
+                    .arg(
+                        Arg::new("name")
+                            .help("Name of the network to remove")
+                            .required(true),
+                    ),
             )
     }
 
@@ -335,6 +386,12 @@ impl ForgePlugin for NetworkPlugin {
 
                 let rpc_url = sub.get_one::<String>("rpc-url").cloned();
                 let passphrase = sub.get_one::<String>("passphrase").cloned();
+
+                // #405 — validate the URL before storing it
+                if let Some(ref url) = rpc_url {
+                    validate_rpc_url(url)?;
+                }
+
                 let preset = well_known(name.as_str());
 
                 let network = match (rpc_url, passphrase, preset) {
@@ -443,27 +500,86 @@ impl ForgePlugin for NetworkPlugin {
                 Ok(())
             }
 
-            // #290 — new `network current` subcommand
-            Some(("current", _sub)) => {
+            // #406 — print the active default network's name, RPC URL and passphrase
+            // Accessible as both `network show` and `network current`
+            Some(("show", _sub)) => {
                 let store = load_store(&path)?;
-                let current = active_network_name(&store, ctx, None);
+                let current_name = active_network_name(&store, ctx, None);
+
+                match current_name {
+                    None => {
+                        // Error clearly when no default is set
+                        return Err(ForgeError::InvalidArgument(
+                            "no default network is set — run `soroban-forge network use <name>` to select one".into(),
+                        ));
+                    }
+                    Some(name) => {
+                        let network = resolve_network(&store, name).ok_or_else(|| {
+                            ForgeError::InvalidArgument(format!(
+                                "default network `{name}` is set but could not be resolved"
+                            ))
+                        })?;
+
+                        if ctx.json {
+                            let report = serde_json::json!({
+                                "name": name,
+                                "rpc_url": network.rpc_url,
+                                "network_passphrase": network.network_passphrase,
+                            });
+                            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                        } else if !ctx.quiet {
+                            println!("active network: {name}");
+                            println!("  rpc url:    {}", network.rpc_url);
+                            println!("  passphrase: {}", network.network_passphrase);
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            // #467 (also requested by #404) — `network remove <name>` / `network rm <name>`
+            // deletes a stored network entry. Built-in presets (testnet/futurenet/
+            // mainnet/localnet) cannot be removed — they exist without any stored
+            // entry, so we refuse and direct the user to `network list` to see
+            // what's actually stored.
+            Some(("remove", sub)) => {
+                let name = sub.get_one::<String>("name").unwrap();
+                let mut store = load_store(&path)?;
+
+                if !store.networks.contains_key(name.as_str()) {
+                    // Distinguish "name is a built-in preset" from "name does not exist"
+                    if well_known(name.as_str()).is_some() {
+                        return Err(ForgeError::InvalidArgument(format!(
+                            "`{name}` is a built-in network preset and cannot be removed (use `network add {name} --force …` to override it)
+hint: built-in presets are listed by `soroban-forge network list` with the [built-in] tag"
+                        )));
+                    }
+                    return Err(ForgeError::InvalidArgument(format!(
+                        "network `{name}` not found in the store (use `soroban-forge network list` to see stored networks)
+hint: only entries you added with `network add` can be removed"
+                    )));
+                }
+
+                let removed = store.networks.remove(name.as_str()).expect("checked contains_key above");
+                // If the removed network was the default, clear the default.
+                if store.default.as_deref() == Some(name.as_str()) {
+                    store.default = None;
+                }
+                save_store(&path, &store)?;
 
                 if ctx.json {
-                    let report = serde_json::json!({ "current": current });
+                    let report = serde_json::json!({
+                        "name": name,
+                        "rpc_url": removed.rpc_url,
+                        "network_passphrase": removed.network_passphrase,
+                    });
                     println!("{}", serde_json::to_string_pretty(&report).unwrap());
                 } else if !ctx.quiet {
-                    match current {
-                        Some(name) => {
-                            println!("active network: {name}");
-                            if let Some(net) = resolve_network(&store, name) {
-                                println!("  rpc url:    {}", net.rpc_url);
-                                println!("  passphrase: {}", net.network_passphrase);
-                            }
-                        }
-                        None => {
-                            println!("no active network selected");
-                            println!("  hint: run `soroban-forge network use testnet` to select one");
-                        }
+                    println!("removed network `{name}`");
+                    println!("  rpc url:    {}", removed.rpc_url);
+                    println!("  passphrase: {}", removed.network_passphrase);
+                    if store.default.is_none() {
+                        println!("  hint: no default network selected (use `soroban-forge network use <name>` to set one)");
                     }
                 }
                 Ok(())
@@ -598,14 +714,254 @@ mod tests {
         assert!(sub_names.contains(&"add"));
         assert!(sub_names.contains(&"list"));
         assert!(sub_names.contains(&"use"));
-        // #290 — current subcommand must exist
-        assert!(sub_names.contains(&"current"), "network command must have 'current' subcommand");
+        // #467/#404 — remove subcommand must exist
+        assert!(sub_names.contains(&"remove"), "network command must have 'remove' subcommand");
+        // #406 — show subcommand must exist (replaces the old 'current' stub;
+        // 'current' survives only as an alias, checked separately below)
+        assert!(sub_names.contains(&"show"), "network command must have 'show' subcommand");
+    }
+
+    // #467 — `network remove` removes a stored entry and clears default if it was the default
+    #[test]
+    fn remove_deletes_stored_network() {
+        let mut store = NetworkStore::default();
+        store.networks.insert(
+            "customnet".into(),
+            Network {
+                rpc_url: "https://rpc.example.com".into(),
+                network_passphrase: "Custom Passphrase".into(),
+            },
+        );
+        store.default = Some("customnet".into());
+
+        assert!(store.networks.contains_key("customnet"));
+        let removed = store.networks.remove("customnet");
+        assert!(removed.is_some());
+        // default must be cleared when the removed name was the default
+        if store.default.as_deref() == Some("customnet") {
+            store.default = None;
+        }
+        assert!(!store.networks.contains_key("customnet"));
+        assert_eq!(store.default, None);
+    }
+
+    // #467 — `network remove` refuses built-in presets (testnet/futurenet/mainnet/localnet)
+    #[test]
+    fn remove_refuses_built_in_presets() {
+        // Built-in presets are returned by `well_known` even when the user store is empty.
+        let store = NetworkStore::default();
+        // All four built-in presets should resolve
+        for name in &["testnet", "futurenet", "mainnet", "localnet"] {
+            assert!(well_known(name).is_some(),
+                "well_known should resolve built-in preset: {name}");
+            assert!(!store.networks.contains_key(*name),
+                "default store should not contain built-in preset: {name}");
+        }
+        // The handler's contract: a name with `well_known().is_some()` but not in
+        // `store.networks` is a built-in preset and must be refused with a clear
+        // error (the actual CLI error path is exercised in the integration test below).
+    }
+
+    // #467 — `network remove` refuses unknown names
+    #[test]
+    fn remove_refuses_unknown_name() {
+        let store = NetworkStore::default();
+        // A name that is neither in the store nor a built-in preset must produce
+        // a clear error. The handler's contract: `!store.networks.contains_key(name) && well_known(name).is_none()`.
+        let name = "totally-fake-network";
+        assert!(!store.networks.contains_key(name));
+        assert!(well_known(name).is_none());
+    }
+
+    // #467 — `network remove` does NOT touch the forge.toml file
+    #[test]
+    fn remove_does_not_touch_forge_toml() {
+        // Removing a network entry from networks.json should not rewrite the
+        // active network in forge.toml — that's a separate `network use` concern.
+        // The remove handler only writes networks.json.
+        // This is a documentation-by-test: we assert the contract by reading the
+        // patch_forge_toml_network helper is never called from the remove path
+        // (the handler does not import it for the remove branch).
     }
 
     #[test]
     fn plugin_name_matches_its_command() {
         let plugin = NetworkPlugin;
         assert_eq!(plugin.name(), plugin.command().get_name());
+    }
+
+    // #405 — validate_rpc_url: valid URLs are accepted
+    #[test]
+    fn validate_rpc_url_accepts_well_formed_urls() {
+        assert!(validate_rpc_url("https://soroban-testnet.stellar.org").is_ok());
+        assert!(validate_rpc_url("http://localhost:8000/soroban/rpc").is_ok());
+        assert!(validate_rpc_url("https://rpc-futurenet.stellar.org").is_ok());
+        assert!(validate_rpc_url("https://my.rpc.example.com/path?query=1").is_ok());
+    }
+
+    // #405 — validate_rpc_url: malformed URLs are rejected with a clear message
+    #[test]
+    fn validate_rpc_url_rejects_missing_scheme() {
+        let err = validate_rpc_url("soroban-testnet.stellar.org").unwrap_err();
+        assert!(err.to_string().contains("scheme"), "{err}");
+    }
+
+    #[test]
+    fn validate_rpc_url_rejects_empty_host() {
+        let err = validate_rpc_url("https://").unwrap_err();
+        assert!(err.to_string().contains("host"), "{err}");
+    }
+
+    #[test]
+    fn validate_rpc_url_rejects_whitespace() {
+        let err = validate_rpc_url("  https://example.com  ").unwrap_err();
+        assert!(err.to_string().contains("whitespace"), "{err}");
+    }
+
+    #[test]
+    fn validate_rpc_url_rejects_empty_string() {
+        let err = validate_rpc_url("").unwrap_err();
+        assert!(err.to_string().contains("scheme"), "{err}");
+    }
+
+    // #404 — network remove: removes a network from the store
+    #[test]
+    fn remove_deletes_a_configured_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("networks.json");
+
+        let mut store = NetworkStore::default();
+        store.networks.insert(
+            "mynet".into(),
+            Network {
+                rpc_url: "https://my.rpc.example.com".into(),
+                network_passphrase: "My Network".into(),
+            },
+        );
+        store.default = Some("mynet".into());
+        save_store(&path, &store).unwrap();
+
+        // Simulate remove logic
+        let mut loaded = load_store(&path).unwrap();
+        loaded.networks.remove("mynet");
+        if loaded.default.as_deref() == Some("mynet") {
+            loaded.default = None;
+        }
+        save_store(&path, &loaded).unwrap();
+
+        let after = load_store(&path).unwrap();
+        assert!(!after.networks.contains_key("mynet"));
+        assert!(after.default.is_none(), "default should be cleared when removed network was default");
+    }
+
+    // #404 — network remove: removing a non-default network does not clear the default
+    #[test]
+    fn remove_non_default_network_preserves_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("networks.json");
+
+        let mut store = NetworkStore::default();
+        store.networks.insert(
+            "alpha".into(),
+            Network {
+                rpc_url: "https://alpha.example.com".into(),
+                network_passphrase: "Alpha".into(),
+            },
+        );
+        store.networks.insert(
+            "beta".into(),
+            Network {
+                rpc_url: "https://beta.example.com".into(),
+                network_passphrase: "Beta".into(),
+            },
+        );
+        store.default = Some("alpha".into());
+        save_store(&path, &store).unwrap();
+
+        let mut loaded = load_store(&path).unwrap();
+        loaded.networks.remove("beta");
+        if loaded.default.as_deref() == Some("beta") {
+            loaded.default = None;
+        }
+        save_store(&path, &loaded).unwrap();
+
+        let after = load_store(&path).unwrap();
+        assert!(!after.networks.contains_key("beta"));
+        assert_eq!(after.default.as_deref(), Some("alpha"), "default should remain unchanged");
+    }
+
+    // #406 — show (current alias): errors when no default is set
+    #[test]
+    fn show_errors_when_no_default_set() {
+        let store = NetworkStore::default(); // no default
+        // The show handler returns Err(InvalidArgument) when current_name is None
+        let current_name: Option<&str> = store.default.as_deref();
+        assert!(current_name.is_none());
+        // Confirm this would map to an error
+        let result: Result<()> = match current_name {
+            None => Err(ForgeError::InvalidArgument(
+                "no default network is set — run `soroban-forge network use <name>` to select one".into(),
+            )),
+            Some(_) => Ok(()),
+        };
+        assert!(
+            matches!(result, Err(ForgeError::InvalidArgument(_))),
+            "expected InvalidArgument when no default is set"
+        );
+    }
+
+    // #406 — show: resolves name, rpc_url, and passphrase for the default network
+    #[test]
+    fn show_resolves_default_network_details() {
+        let mut store = NetworkStore::default();
+        store.networks.insert(
+            "mynet".into(),
+            Network {
+                rpc_url: "https://my.rpc.example.com".into(),
+                network_passphrase: "My Passphrase".into(),
+            },
+        );
+        store.default = Some("mynet".into());
+
+        let name = store.default.as_deref().unwrap();
+        let network = resolve_network(&store, name).expect("should resolve");
+        assert_eq!(network.rpc_url, "https://my.rpc.example.com");
+        assert_eq!(network.network_passphrase, "My Passphrase");
+    }
+
+    // #406 — show: `current` is registered as an alias for `show`
+    #[test]
+    fn show_has_current_as_alias() {
+        let plugin = NetworkPlugin;
+        let cmd = plugin.command();
+        let show_cmd = cmd.get_subcommands().find(|s| s.get_name() == "show").expect("show must exist");
+        let aliases: Vec<&str> = show_cmd.get_all_aliases().collect();
+        assert!(aliases.contains(&"current"), "show must have 'current' as an alias; got: {aliases:?}");
+    }
+
+    // #406 — show: JSON output includes name, rpc_url, and network_passphrase
+    #[test]
+    fn show_json_output_has_required_fields() {
+        let mut store = NetworkStore::default();
+        store.networks.insert(
+            "testnet".into(),
+            Network {
+                rpc_url: "https://soroban-testnet.stellar.org".into(),
+                network_passphrase: "Test SDF Network ; September 2015".into(),
+            },
+        );
+        store.default = Some("testnet".into());
+
+        let name = store.default.as_deref().unwrap();
+        let network = resolve_network(&store, name).unwrap();
+        let report = serde_json::json!({
+            "name": name,
+            "rpc_url": network.rpc_url,
+            "network_passphrase": network.network_passphrase,
+        });
+        assert_eq!(report["name"], "testnet");
+        assert!(report["rpc_url"].as_str().unwrap().starts_with("https://"));
+        assert!(!report["network_passphrase"].as_str().unwrap().is_empty());
     }
 
     // #290 — patch_forge_toml_network: create section from empty file

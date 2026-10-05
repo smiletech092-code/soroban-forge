@@ -33,7 +33,8 @@ pub struct ForgeContext {
 }
 
 impl ForgeContext {
-    /// Build a context for `cwd`, loading `forge.toml` if present.
+    /// Build a context for `cwd`, loading project configuration and optional
+    /// user-level defaults.
     pub fn new(cwd: PathBuf, verbose: u8) -> Result<Self> {
         Self::with_output(cwd, verbose, false, false, false)
     }
@@ -51,9 +52,11 @@ impl ForgeContext {
 
     /// Build a context with all global invocation controls.
     ///
-    /// `config_path`, when set (from `--config`), is loaded directly and
+    /// `config_path`, when set (from `--config`), replaces project config and
     /// errors if missing/invalid. Otherwise `forge.toml` is discovered by
-    /// walking up from `cwd`, same as before.
+    /// walking up from `cwd`. In either case, user defaults are loaded and
+    /// overridden field-by-field by project config.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_options(
         cwd: PathBuf,
         verbose: u8,
@@ -65,10 +68,12 @@ impl ForgeContext {
         timeout_secs: Option<u64>,
         config_path: Option<PathBuf>,
     ) -> Result<Self> {
-        let config = match &config_path {
+        let project_config = match &config_path {
             Some(path) => Some(ForgeConfig::load_from_path(path)?),
             None => ForgeConfig::load_from(&cwd)?,
         };
+        let user_config = ForgeConfig::load_user_config()?;
+        let config = ForgeConfig::load_effective(project_config, user_config);
         Ok(Self {
             cwd,
             config,
@@ -136,14 +141,16 @@ mod tests {
     #[test]
     fn context_accepts_explicit_quiet_mode() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ForgeContext::with_output(dir.path().to_path_buf(), 0, true, false, false).unwrap();
+        let ctx =
+            ForgeContext::with_output(dir.path().to_path_buf(), 0, true, false, false).unwrap();
         assert!(ctx.quiet);
     }
 
     #[test]
     fn context_accepts_explicit_json_mode() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ForgeContext::with_output(dir.path().to_path_buf(), 0, false, true, false).unwrap();
+        let ctx =
+            ForgeContext::with_output(dir.path().to_path_buf(), 0, false, true, false).unwrap();
         assert!(ctx.json);
     }
 
@@ -166,7 +173,8 @@ mod tests {
     #[test]
     fn context_accepts_explicit_yes_mode() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ForgeContext::with_output(dir.path().to_path_buf(), 0, false, false, true).unwrap();
+        let ctx =
+            ForgeContext::with_output(dir.path().to_path_buf(), 0, false, false, true).unwrap();
         assert!(ctx.yes);
     }
 
