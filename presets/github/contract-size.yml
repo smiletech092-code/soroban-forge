@@ -22,12 +22,16 @@ jobs:
     name: "{{project_name}}: contract size"
     runs-on: ubuntu-latest
     steps:
+      # ci-init-step: contract-size/contract-size/checkout
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      # ci-init-step: contract-size/contract-size/install-rust
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
           targets: wasm32v1-none
+      # ci-init-step: contract-size/contract-size/rust-cache
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      # ci-init-step: contract-size/contract-size/cache-wasm-target
       - name: Cache target/wasm32v1-none
         uses: actions/cache@v4
         with:
@@ -37,9 +41,11 @@ jobs:
           restore-keys: |
             wasm-target-${{ runner.os }}-
 
+      # ci-init-step: contract-size/contract-size/build-pr-contract
       - name: Build contract (PR branch)
         run: cargo build --target wasm32v1-none --release
 
+      # ci-init-step: contract-size/contract-size/record-pr-sizes
       - name: Record PR wasm sizes
         run: |
           mkdir -p /tmp/sizes
@@ -49,6 +55,7 @@ jobs:
             wc -c < "$wasm" > "/tmp/sizes/pr_${name}"
           done
 
+      # ci-init-step: contract-size/contract-size/check-max-size
       - name: Check max contract size
         run: |
           status=0
@@ -69,11 +76,13 @@ jobs:
           fi
           exit "$status"
 
+      # ci-init-step: contract-size/contract-size/checkout-base
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           clean: false
 
+      # ci-init-step: contract-size/contract-size/build-base-contract
       - name: Build contract (base branch)
         run: |
           rm -f target/wasm32v1-none/release/*.wasm
@@ -84,6 +93,7 @@ jobs:
             wc -c < "$wasm" > "/tmp/sizes/base_${name}"
           done
 
+      # ci-init-step: contract-size/contract-size/comment-size-delta
       - name: Comment size delta on PR
         if: always()
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7

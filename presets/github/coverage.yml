@@ -19,14 +19,20 @@ jobs:
     name: "{{project_name}}: coverage"
     runs-on: ubuntu-latest
     steps:
+      # ci-init-step: coverage/coverage/checkout
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      # ci-init-step: coverage/coverage/install-rust
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+      # ci-init-step: coverage/coverage/rust-cache
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      # ci-init-step: coverage/coverage/install-llvm-cov
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
+      # ci-init-step: coverage/coverage/run-coverage-tests
       - name: Run tests with coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      # ci-init-step: coverage/coverage/upload-codecov
       - name: Upload coverage to Codecov
         if: ${{ secrets.CODECOV_TOKEN != '' }}
         uses: codecov/codecov-action@v4
@@ -35,6 +41,7 @@ jobs:
           files: lcov.info
           flags: unittests
           fail_ci_if_error: true
+      # ci-init-step: coverage/coverage/skip-codecov
       - name: Skip Codecov upload without token
         if: ${{ secrets.CODECOV_TOKEN == '' }}
         run: echo "CODECOV_TOKEN not configured; skipping upload."

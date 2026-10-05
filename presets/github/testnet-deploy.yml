@@ -26,12 +26,16 @@ jobs:
     runs-on: ubuntu-latest
     environment: testnet
     steps:
+      # ci-init-step: testnet-deploy/deploy/checkout
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      # ci-init-step: testnet-deploy/deploy/install-rust
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
           targets: wasm32v1-none
+      # ci-init-step: testnet-deploy/deploy/rust-cache
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      # ci-init-step: testnet-deploy/deploy/cache-wasm-target
       - name: Cache target/wasm32v1-none
         uses: actions/cache@v4
         with:
@@ -40,12 +44,14 @@ jobs:
           key: wasm-target-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             wasm-target-${{ runner.os }}-
+      # ci-init-step: testnet-deploy/deploy/cache-stellar-cli
       - name: Cache stellar-cli
         id: cache-stellar-cli
         uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9  # v4
         with:
           path: ~/.local/bin/stellar
           key: stellar-cli-${{ env.STELLAR_CLI_VERSION }}
+      # ci-init-step: testnet-deploy/deploy/install-stellar-cli
       - name: Install stellar-cli
         if: steps.cache-stellar-cli.outputs.cache-hit != 'true'
         # Official binary from stellar-cli releases, pinned to a specific version.
@@ -57,8 +63,10 @@ jobs:
             | tar xz -C ~/.local/bin stellar
           chmod +x ~/.local/bin/stellar
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      # ci-init-step: testnet-deploy/deploy/build-contract
       - name: Build contract
         run: cargo build --target wasm32v1-none --release
+      # ci-init-step: testnet-deploy/deploy/deploy-to-testnet
       - name: Deploy to testnet
         env:
           STELLAR_DEPLOYER_SECRET: ${{ secrets.STELLAR_DEPLOYER_SECRET }}
