@@ -23,6 +23,8 @@ const ACTIONLINT_WORKFLOW: &str = "actionlint.yml";
 const DENY_TOML: &str = "deny.toml";
 const HEALTHCHECK_WORKFLOW: &str = "testnet-healthcheck.yml";
 const STALE_WORKFLOW: &str = "stale.yml";
+const STEP_MARKER: &str = "# ci-init-step: ";
+const STEP_OVERRIDES_DIR: &str = ".soroban-forge/ci-overrides/github";
 pub const DEFAULT_MSRV: &str = "1.84";
 pub const DEFAULT_MAX_SIZE: u64 = 65_536;
 const DEPENDABOT_CONFIG: &str = "dependabot.yml";
@@ -110,6 +112,100 @@ fn project_name(dir: &Path, ctx: &ForgeContext) -> String {
     dir.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "contract".to_string())
+}
+
+fn render_preset(dir: &Path, provider: &str, contents: &str, vars: &Vars) -> Result<String> {
+    let rendered = render_str(contents, vars);
+    if provider != "github" || !rendered.contains(STEP_MARKER) {
+        return Ok(rendered);
+    }
+
+    let lines: Vec<&str> = rendered.split_inclusive('\n').collect();
+    let mut output = String::with_capacity(rendered.len());
+    let mut index = 0;
+    while index < lines.len() {
+        let Some(marker) = lines[index].trim_start().strip_prefix(STEP_MARKER) else {
+            output.push_str(lines[index]);
+            index += 1;
+            continue;
+        };
+
+        let marker = marker.trim();
+        let mut step_index = index + 1;
+        while step_index < lines.len() && lines[step_index].trim().is_empty() {
+            step_index += 1;
+        }
+        if step_index == lines.len() {
+            return Err(ForgeError::Template(format!(
+                "step marker `{marker}` has no step"
+            )));
+        }
+
+        let step_indent = lines[step_index].len() - lines[step_index].trim_start().len();
+        if !lines[step_index][step_indent..].starts_with("- ") {
+            return Err(ForgeError::Template(format!(
+                "step marker `{marker}` is not followed by a YAML step"
+            )));
+        }
+
+        let mut end = step_index + 1;
+        while end < lines.len() {
+            let line = lines[end];
+            if !line.trim().is_empty() {
+                let indent = line.len() - line.trim_start().len();
+                if indent <= step_indent {
+                    break;
+                }
+            }
+            end += 1;
+        }
+
+        let override_path = dir.join(format!("{STEP_OVERRIDES_DIR}/{marker}.yml"));
+        if override_path.exists() {
+            let override_contents = std::fs::read_to_string(&override_path)
+                .map_err(ForgeError::io(format!("reading {}", override_path.display())))?;
+            let override_rendered = render_str(&override_contents, vars);
+            output.push_str(&indent_step(&override_rendered, step_indent, marker)?);
+        } else {
+            for line in &lines[step_index..end] {
+                output.push_str(line);
+            }
+        }
+        index = end;
+    }
+    Ok(output)
+}
+
+fn indent_step(step: &str, indent: usize, marker: &str) -> Result<String> {
+    let lines: Vec<&str> = step.lines().collect();
+    let baseline = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let first = lines
+        .iter()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| ForgeError::Template(format!("step override `{marker}` is empty")))?;
+    if !first[baseline..].starts_with("- ") {
+        return Err(ForgeError::Template(format!(
+            "step override `{marker}` must contain one YAML list item"
+        )));
+    }
+
+    let prefix = " ".repeat(indent);
+    let mut output = String::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            output.push('\n');
+        } else {
+            output.push_str(&prefix);
+            output.push_str(&line[baseline..]);
+            output.push('\n');
+        }
+    }
+    Ok(output)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -246,7 +342,7 @@ pub fn generate(
         if out_path.exists() && !force {
             return Err(ForgeError::AlreadyExists(out_path));
         }
-        std::fs::write(&out_path, render_str(contents, &vars))
+        std::fs::write(&out_path, render_preset(dir, provider, contents, &vars)?)
             .map_err(ForgeError::io(format!("writing {}", out_path.display())))?;
 
         let rel_path = if dest_rel == "." {
@@ -577,68 +673,29 @@ impl ForgePlugin for CiPresetsPlugin {
             return Ok(());
         }
 
-        // ── --diff ─────────────────────────────────────────────────────────
-        if matches.get_flag("diff") {
-            for provider in &providers {
-                let provider_dir = PRESETS.get_dir(provider.as_str()).ok_or_else(|| {
-                    ForgeError::InvalidArgument(format!(
-                        "unknown provider `{provider}` (available: {})",
-                        available_providers().join(", ")
-                    ))
-                })?;
-                let mut selected: Vec<(&str, Option<&str>)> = match provider.as_str() {
-                    "github" => {
-                        let mut list: Vec<(&str, Option<&str>)> = BASE_WORKFLOWS.iter().map(|n| (*n, None)).collect();
-                        if opts.deploy { list.push((DEPLOY_WORKFLOW, None)); }
-                        if opts.security_scan { list.push((SECURITY_SCAN_WORKFLOW, None)); list.push((DENY_TOML, Some("."))); }
-                        if opts.coverage { list.push((COVERAGE_WORKFLOW, None)); }
-                        if opts.actionlint { list.push((ACTIONLINT_WORKFLOW, None)); }
-                        if opts.healthcheck { list.push((HEALTHCHECK_WORKFLOW, None)); }
-                        if matches.get_flag("release") { list.push((RELEASE_WORKFLOW, None)); }
-                        if opts.matrix { list.push((MATRIX_WORKFLOW, None)); }
-                        if opts.dependabot { list.push((DEPENDABOT_CONFIG, Some(".github"))); }
-                        list
-                    }
-                    "gitlab" => vec![(".gitlab-ci.yml", None)],
-                    "bitbucket" => vec![("bitbucket-pipelines.yml", None)],
-                    "azure" => vec![("azure-pipelines.yml", None)],
-                    "circleci" => vec![("config.yml", None)],
-                    "woodpecker" => vec![(".woodpecker.yml", None)],
-                    "buildkite" => vec![("pipeline.yml", None)],
-                    _ => return Err(ForgeError::InvalidArgument(format!(
-                        "unknown provider `{provider}` (available: {})",
-                        available_providers().join(", ")
-                    ))),
+            for (preset_name, dest_rel_override) in selected.drain(..) {
+                let file = provider_dir
+                    .get_file(format!("{provider}/{preset_name}"))
+                    .ok_or_else(|| ForgeError::Template(format!("missing preset file {provider}/{preset_name}")))?;
+                let contents = file
+                    .contents_utf8()
+                    .ok_or_else(|| ForgeError::Template(format!("preset {preset_name} is not UTF-8")))?;
+                let dest_rel = dest_rel_override.unwrap_or(output_dir(provider));
+                let out_path = dir.join(dest_rel).join(preset_name);
+                let vars = {
+                    let mut vars = Vars::new();
+                    vars.insert("project_name".into(), name.to_string());
+                    vars.insert("crate_name".into(), name.replace('-', "_"));
+                    vars.insert("msrv".into(), opts.msrv.clone().unwrap_or_else(|| DEFAULT_MSRV.to_string()));
+                    vars.insert("max_size".into(), max_size.to_string());
+                    vars
                 };
-
-                for (preset_name, dest_rel_override) in selected.drain(..) {
-                    let file = provider_dir
-                        .get_file(format!("{provider}/{preset_name}"))
-                        .ok_or_else(|| ForgeError::Template(format!("missing preset file {provider}/{preset_name}")))?;
-                    let contents = file
-                        .contents_utf8()
-                        .ok_or_else(|| ForgeError::Template(format!("preset {preset_name} is not UTF-8")))?;
-                    let dest_rel = dest_rel_override.unwrap_or(output_dir(provider));
-                    let out_path = dir.join(dest_rel).join(preset_name);
-                    let rendered = render_str(contents, &{
-                        let mut vars = Vars::new();
-                        vars.insert("project_name".into(), name.to_string());
-                        vars.insert("crate_name".into(), name.replace('-', "_"));
-                        vars.insert("msrv".into(), opts.msrv.clone().unwrap_or_else(|| DEFAULT_MSRV.to_string()));
-                        vars.insert("max_size".into(), max_size.to_string());
-                        vars
-                    });
-                    if out_path.exists() {
-                        let existing = std::fs::read_to_string(&out_path)
-                            .map_err(ForgeError::io(format!("reading {}", out_path.display())))?;
-                        if existing == rendered {
-                            continue;
-                        }
-                        print_diff(&out_path, &rendered)?;
-                    } else {
-                        let parent = out_path.parent().unwrap_or(&dir);
-                        std::fs::create_dir_all(parent).map_err(ForgeError::io(format!("creating {}", parent.display())))?;
-                        print_diff(&out_path, &rendered)?;
+                let rendered = render_preset(&dir, provider, contents, &vars)?;
+                if out_path.exists() {
+                    let existing = std::fs::read_to_string(&out_path)
+                        .map_err(ForgeError::io(format!("reading {}", out_path.display())))?;
+                    if existing == rendered {
+                        continue;
                     }
                 }
             }
@@ -764,6 +821,57 @@ mod tests {
                 .unwrap();
         assert!(contents.contains("codecov/codecov-action@v4"));
         assert!(contents.contains("cargo llvm-cov"));
+    }
+
+    #[test]
+    fn github_step_override_is_applied_again_when_force_regenerating() {
+        let dir = tempfile::tempdir().unwrap();
+        let override_path = dir.path().join(
+            ".soroban-forge/ci-overrides/github/build-test/build-and-test/rust-cache.yml",
+        );
+        std::fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &override_path,
+            "- uses: Swatinem/rust-cache@v2\n  with:\n    key: custom-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}\n",
+        )
+        .unwrap();
+
+        let opts = base_opts();
+        generate(
+            dir.path(),
+            "github",
+            "my-contract",
+            false,
+            false,
+            &opts,
+            false,
+        )
+        .unwrap();
+
+        let workflow_path = dir.path().join(".github/workflows/build-test.yml");
+        let generated = std::fs::read_to_string(&workflow_path).unwrap();
+        assert!(
+            generated.contains("key: custom-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}")
+        );
+        assert!(!generated.contains("ci-init-step:"));
+
+        std::fs::write(&workflow_path, "stale generated workflow\n").unwrap();
+        generate(
+            dir.path(),
+            "github",
+            "my-contract",
+            false,
+            false,
+            &opts,
+            true,
+        )
+        .unwrap();
+
+        let regenerated = std::fs::read_to_string(workflow_path).unwrap();
+        assert!(
+            regenerated.contains("key: custom-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}")
+        );
+        assert!(!regenerated.contains("stale generated workflow"));
     }
 
     #[test]
